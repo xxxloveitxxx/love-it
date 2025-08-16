@@ -1,0 +1,38 @@
+<!-- templates/leads.html -->
+<!DOCTYPE html>
+<html>
+<head>
+  <script src="https://unpkg.com/htmx.org"></script>
+  <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+</head>
+<body class="p-6">
+  <h1 class="text-2xl font-bold mb-4">Real Estate Leads</h1>
+  <button 
+    hx-get="/scrape" 
+    hx-trigger="click" 
+    hx-target="#status"
+    class="px-4 py-2 bg-blue-500 text-white rounded-lg">
+    Scrape New Leads
+  </button>
+  <p id="status" class="mt-2 text-green-600"></p>
+
+  <table class="table-auto w-full mt-4 border">
+    <thead>
+      <tr>
+        <th>Name</th><th>Email</th><th>City</th><th>Brokerage</th><th>Last Sale</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for lead in leads %}
+      <tr>
+        <td>{{ lead.name }}</td>
+        <td>{{ lead.email }}</td>
+        <td>{{ lead.city }}</td>
+        <td>{{ lead.brokerage }}</td>
+        <td>{{ lead.last_sale }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</body>
+</html>
