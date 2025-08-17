@@ -37,7 +37,6 @@ def extract_json_ld(page_content: str) -> List[Dict]:
     results = []
     for match in matches:
         try:
-            # Clean and parse JSON
             clean_match = match.replace('/*<![CDATA[*/', '').replace('/*]]>*/', '')
             data = json.loads(clean_match.strip())
             results.append(data)
@@ -46,6 +45,7 @@ def extract_json_ld(page_content: str) -> List[Dict]:
     return results
 
 async def _set_anti_bot_headers(page: Page):
+    # basic anti-bot headers / navigator tweak
     await page.set_extra_http_headers({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept-Language": "en-US,en;q=0.9"
@@ -68,11 +68,18 @@ async def collect_listing_urls_from_search(
     max_listings: int = 20,
     debug: bool = False,
 ) -> List[str]:
+    """
+    More robust URL collector:
+      - tries multiple JS state names
+      - falls back to scanning ALL anchors for Zillow listing patterns
+      - scrolls and re-checks so lazy-load works
+    """
     page = await context.new_page()
     try:
         await _set_anti_bot_headers(page)
         await page.set_viewport_size({"width": 1366, "height": 768})
 
+        # goto with fallback
         try:
             await page.goto(seed_url, wait_until="domcontentloaded", timeout=30000)
         except PWTimeoutError:
@@ -82,74 +89,124 @@ async def collect_listing_urls_from_search(
                 await page.goto(seed_url, wait_until="networkidle", timeout=30000)
             except Exception:
                 if debug:
-                    print("[debug] goto retry failed; continue and try to parse current DOM")
+                    print("[debug] goto retry failed; continuing with current DOM")
 
         found = set()
         start = time.time()
-        timeout_seconds = 30  # Increased timeout
-        last_count = 0
+        timeout_seconds = 30
+        last_count = -1
 
-        # Wait for listings to load
+        # first try: wait for common property card selector (non-fatal)
         try:
-            await page.wait_for_selector('[data-testid="property-card-link"]', timeout=10000)
+            await page.wait_for_selector('[data-testid="property-card-link"]', timeout=8000)
         except Exception as e:
             if debug:
-                print(f"[debug] Waiting for selector failed: {e}")
+                print(f"[debug] Waiting for property-card-link selector failed: {e}")
 
-        # Try to extract from JavaScript state
+        # Attempt to extract window state JSON — try several possible names
         try:
             state = await page.evaluate("""() => {
-                return window.__initialState__ || window.appState || {};
+                return window.__initialState__ || window.__INITIAL_STATE__ || window.__PRELOADED_STATE__ || window.__NEXT_DATA__ || window.appState || window.__STATE__ || {};
             }""")
-            
-            if state and 'gdpClientCache' in state:
-                for key in state['gdpClientCache']:
-                    if key.startswith('ForSaleDoubleScrollFullRenderQuery'):
-                        data = state['gdpClientCache'][key].get('json', {})
-                        results = data.get('cat1', {}).get('searchResults', [])
-                        for result in results:
-                            if 'detailUrl' in result:
-                                url = _normalize_url(result['detailUrl'])
-                                found.add(url)
-                                if len(found) >= max_listings:
-                                    break
-            if debug:
-                print(f"[debug] Found {len(found)} URLs from state")
-        except Exception as e:
-            if debug:
-                print(f"[debug] State extraction error: {e}")
-
-        # Fallback to DOM scraping
-        while len(found) < max_listings and (time.time() - start) < timeout_seconds:
-            try:
-                # Get all listing links
-                hrefs = await page.eval_on_selector_all(
-                    '[data-testid="property-card-link"]', 
-                    "els => els.map(e => e.href)"
-                )
-                
-                for href in (hrefs or []):
-                    if href and "zillow.com/homedetails/" in href:
-                        href_n = href.split("?")[0].rstrip("/")
-                        found.add(href_n)
+            if state:
+                text_state = json.dumps(state)
+                # quick regex for homedetails or zpid urls
+                for m in re.finditer(r"https?://[^\s'\"]*(zillow\.com[^\s'\"<>]+)", text_state):
+                    url = m.group(0)
+                    if "homedetails" in url or "_zpid" in url or "zpid" in url:
+                        urln = url.split("?")[0].rstrip("/")
+                        found.add(urln)
                         if len(found) >= max_listings:
                             break
+            if debug:
+                print(f"[debug] Found {len(found)} URLs from page state")
+        except Exception as e:
+            if debug:
+                print("[debug] state extraction error:", e)
 
-                # Scroll to load more results
+        # fallback strategies: DOM anchors, JSON-LD, data attributes
+        attempts = 0
+        while len(found) < max_listings and (time.time() - start) < timeout_seconds and attempts < 8:
+            attempts += 1
+            try:
+                # 1) Try data-testid property-card-link anchors
+                try:
+                    hrefs = await page.eval_on_selector_all(
+                        '[data-testid="property-card-link"]', "els => els.map(e => e.href)"
+                    )
+                    if hrefs:
+                        for href in hrefs:
+                            if not href:
+                                continue
+                            if "zillow.com/homedetails" in href or "_zpid" in href or "zillow.com/" in href:
+                                href_n = href.split("?")[0].rstrip("/")
+                                found.add(href_n)
+                                if len(found) >= max_listings:
+                                    break
+                except Exception:
+                    # ignore if that selector not present or errors
+                    pass
+
+                # 2) Scrape all anchors and filter by common Zillow listing patterns
+                try:
+                    all_hrefs = await page.eval_on_selector_all("a", "els => els.map(e => e.href)")
+                    for href in (all_hrefs or []):
+                        if not href:
+                            continue
+                        low = href.lower()
+                        if "zillow.com/homedetails" in low or "_zpid" in low or "/homedetails/" in low:
+                            href_n = href.split("?")[0].rstrip("/")
+                            found.add(href_n)
+                            if len(found) >= max_listings:
+                                break
+                except Exception:
+                    pass
+
+                # 3) Look for JSON-LD ItemList or Offer items that include URLs
+                try:
+                    page_html = await page.content()
+                    json_ld = extract_json_ld(page_html)
+                    for obj in json_ld:
+                        # some search pages include ItemList of listings
+                        # traverse dicts / lists to extract strings that look like zillow links
+                        jtext = json.dumps(obj)
+                        for m in re.finditer(r"https?://[^\s'\"]*(zillow\.com[^\s'\"<>]+)", jtext):
+                            url = m.group(0)
+                            if "homedetails" in url or "_zpid" in url:
+                                urln = url.split("?")[0].rstrip("/")
+                                found.add(urln)
+                                if len(found) >= max_listings:
+                                    break
+                        if len(found) >= max_listings:
+                            break
+                except Exception:
+                    pass
+
+                # 4) Scroll a bit and wait so lazy-showing cards appear
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
-                await page.wait_for_timeout(1500 + random.randint(0, 500))
-                
+                await page.wait_for_timeout(1200 + random.randint(0, 800))
+
             except Exception as e:
                 if debug:
-                    print(f"[debug] URL collection error: {e}")
+                    print(f"[debug] URL collection loop error: {e}")
                 break
 
             if len(found) == last_count:
+                # nothing new this iteration -> small pause then break out if repeated
                 await page.wait_for_timeout(500)
-                break
+                if attempts >= 4:
+                    break
             last_count = len(found)
 
-        results = list(found)
+        # final cleanup: normalize and limit
+        results = []
+        for u in found:
+            try:
+                results.append(_normalize_url(u))
+            except Exception:
+                results.append(u)
+        results = [r.split("?")[0].rstrip("/") for r in results]
+        results = list(dict.fromkeys(results))  # preserve unique order-ish
         if debug:
             print(f"[debug] collect_listing_urls_from_search found {len(results)} urls (limit {max_listings})")
         return results[:max_listings]
