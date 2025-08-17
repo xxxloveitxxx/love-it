@@ -2,46 +2,55 @@
 import os
 import sys
 from pathlib import Path
+import asyncio
+from dotenv import load_dotenv
 
-# ---- Ensure repo root is on sys.path ----
-# If this file lives in <repo>/scripts/run_scraper.py, repo_root = parent of scripts
+# ensure repo root on path
 repo_root = Path(__file__).resolve().parents[1]
 if str(repo_root) not in sys.path:
     sys.path.insert(0, str(repo_root))
 
-# ---- Debug info (prints to CI logs) ----
-print("CWD:", os.getcwd())
-print("Script path:", Path(__file__).resolve())
-print("Repo root added to sys.path:", repo_root)
-print("sys.path[0:6]:", sys.path[:6])
+load_dotenv()
 
-# ---- Now import your module(s) ----
-try:
-    from models import save_leads
-except Exception as e:
-    print("ERROR importing 'models' module:", e)
-    # show files at repo root to help debug in CI
-    try:
-        print("Files at repo root:", list(repo_root.iterdir()))
-    except Exception:
-        pass
-    raise
+from scraper.zillow_scraper import run_scrape
+from models import save_leads
 
-# ---- Main runner (sample) ----
-def main():
-    sample_leads = [
-        {
-            "name": "GitHub Actions Test Agent",
-            "email": "gh-action-test+1@example.com",
-            "city": "Test City",
-            "brokerage": "Test Brokerage",
-            "last_sale": "2025-08-01",
-            "source": "zillow"
-        }
+# config: get seed urls from env variable or fallback to examples
+SEED_URLS_RAW = os.getenv("ZILLOW_SEED_URLS", "")
+if SEED_URLS_RAW:
+    SEED_URLS = [u.strip() for u in SEED_URLS_RAW.split(",") if u.strip()]
+else:
+    # Example search seed(s) — replace with the search URLs you want to scan.
+    SEED_URLS = [
+        "https://www.zillow.com/homes/for_sale/San-Francisco-CA_rb/",
+        "https://www.zillow.com/homes/for_sale/Los-Angeles-CA_rb/"
     ]
-    print("Saving sample leads to Supabase...")
-    res = save_leads(sample_leads)
-    print("Result:", res)
+
+
+async def main():
+    print("Starting Zillow scrape; seeds:", SEED_URLS)
+    leads = await run_scrape(
+        search_urls=SEED_URLS,
+        max_listings_per_search=int(os.getenv("MAX_LISTINGS_PER_SEARCH", "6")),
+        max_listings_total=int(os.getenv("MAX_LISTINGS_TOTAL", "12")),
+        headless=(os.getenv("PLAYWRIGHT_HEADLESS", "1") == "1"),
+        delay_min=float(os.getenv("DELAY_MIN", "2.0")),
+        delay_max=float(os.getenv("DELAY_MAX", "5.0")),
+        proxy=os.getenv("HTTP_PROXY") or os.getenv("PROXY")
+    )
+
+    # Filter out leads with no name and no email (optional)
+    filtered = []
+    for l in leads:
+        if l.get("name") or l.get("email"):
+            filtered.append(l)
+
+    print(f"Collected {len(filtered)} leads. Saving to Supabase...")
+    if filtered:
+        res = save_leads(filtered)
+        print("Supabase result:", res)
+    else:
+        print("No leads to save.")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
