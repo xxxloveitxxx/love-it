@@ -20,14 +20,29 @@ jobs:
           python-version: '3.11'
 
       - name: Install apt packages required by Playwright
-        # some Playwright linux dependencies; safe on ubuntu-latest
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
+
+          # Try the canonical package list for Playwright on modern Ubuntu.
+          # Note: on Ubuntu 24.04 "libasound2" may be provided as "libasound2t64".
+          sudo apt-get install -y --no-install-recommends \
             libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libxkbcommon0 \
-            libxcomposite1 libxcb1 libxrandr2 libxss1 libasound2 libgbm1 \
+            libxcomposite1 libxcb1 libxrandr2 libxss1 libgbm1 \
             libx11-xcb1 libxdamage1 libxinerama1 libxi6 libpangocairo-1.0-0 \
-            libpango-1.0-0
+            libpango-1.0-0 libgtk-3-0 || true
+
+          # Ensure sound library attempt: prefer libasound2t64 (Ubuntu 24.04)
+          if ! dpkg -s libasound2t64 >/dev/null 2>&1; then
+            echo "Attempting to install libasound2 (fallback)..."
+            sudo apt-get install -y --no-install-recommends libasound2 || true
+          else
+            sudo apt-get install -y --no-install-recommends libasound2t64 || true
+          fi
+
+          # verify installed packages (helpful for debugging)
+          echo "Installed packages (grep a few expected names):"
+          dpkg -l | egrep 'libnss3|libgtk-3-0|libgbm|libasound' || true
+
 
       - name: Cache pip
         uses: actions/cache@v4
