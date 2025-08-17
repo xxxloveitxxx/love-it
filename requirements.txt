@@ -6,3 +6,9 @@ supabase==2.6.0
 python-dotenv==1.0.1
 gspread==6.0.2
 google-auth==2.35.0
+
+
+greenlet>=3.1.0
+pandas>=2.2.3
+# optionally pick a newer pandas like 2.3.x if you want
+# AND make sure playwright does not pin an older greenlet version
