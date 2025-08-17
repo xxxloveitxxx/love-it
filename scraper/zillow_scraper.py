@@ -22,6 +22,19 @@ from playwright.async_api import (
 
 
 
+def _normalize_url(href: str) -> str:
+    if not href:
+        return href
+    href = href.strip()
+    if href.startswith("//"):
+        return "https:" + href
+    if href.startswith("/"):
+        return urllib.parse.urljoin("https://www.zillow.com", href)
+    if href.startswith("http://") or href.startswith("https://"):
+        return href
+    return urllib.parse.urljoin("https://www.zillow.com", href)
+
+
 # Add these new functions
 def get_random_user_agent():
     agents = [
@@ -133,20 +146,6 @@ async def collect_listing_urls_from_search(
                 print("CAPTCHA bypass failed. Skipping seed.")
             return []
 
-
-
-
-def _normalize_url(href: str) -> str:
-    if not href:
-        return href
-    href = href.strip()
-    if href.startswith("//"):
-        return "https:" + href
-    if href.startswith("/"):
-        return urllib.parse.urljoin("https://www.zillow.com", href)
-    if href.startswith("http://") or href.startswith("https://"):
-        return href
-    return urllib.parse.urljoin("https://www.zillow.com", href)
 
 def extract_json_ld(page_content: str) -> List[Dict]:
     """Extract structured JSON-LD data from page source"""
