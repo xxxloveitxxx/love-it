@@ -8,6 +8,8 @@ on:
 jobs:
   run-scraper:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -17,18 +19,44 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
+      - name: Install apt packages required by Playwright
+        # some Playwright linux dependencies; safe on ubuntu-latest
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libxkbcommon0 \
+            libxcomposite1 libxcb1 libxrandr2 libxss1 libasound2 libgbm1 \
+            libx11-xcb1 libxdamage1 libxinerama1 libxi6 libpangocairo-1.0-0 \
+            libpango-1.0-0
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: ${{ runner.os }}-pip-
+
+      - name: Install Python dependencies
         env:
           PIP_NO_CACHE_DIR: "off"
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Install Playwright browsers + deps
+        # installs browser binaries and native deps used by Playwright
+        run: |
+          # prefer the python wrapper installer
+          python -m playwright install --with-deps
+
       - name: Run scraper script
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-          # If you use other secrets (Google creds / sheets) add them here
-          # GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          # optional: override seeds / behavior via env
+          # ZILLOW_SEED_URLS: "https://www.zillow.com/homes/for_sale/San-Francisco-CA_rb/,https://www.zillow.com/homes/for_sale/Chicago-IL_rb/"
+          # MAX_LISTINGS_PER_SEARCH: "6"
+          # MAX_LISTINGS_TOTAL: "12"
         run: |
-          python scripts/run_scraper.py
+          # ensure the repo root is in PYTHONPATH so `import models` works
+          PYTHONPATH=. python scripts/run_scraper.py
