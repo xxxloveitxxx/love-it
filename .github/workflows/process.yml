@@ -70,7 +70,7 @@ jobs:
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           DEBUG: "true"
           MAX_LISTINGS_TOTAL: "2"
-          ZILLOW_SEED_URLS: "https://www.zillow.com/professionals/real-estate-agent-reviews/san-francisco-ca/"
+          ZILLOW_SEED_URLS: "https://www.zillow.com/homes/for_sale/San-Francisco-CA_rb/"
         run: |
          PYTHONPATH=. python scripts/run_scraper.py
   
