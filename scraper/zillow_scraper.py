@@ -18,6 +18,124 @@ from playwright.async_api import (
 # -------------------------
 # helpers
 # -------------------------
+
+
+
+
+# Add these new functions
+def get_random_user_agent():
+    agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+    ]
+    return random.choice(agents)
+
+def get_random_viewport():
+    sizes = [
+        {"width": 1366, "height": 768},
+        {"width": 1920, "height": 1080},
+        {"width": 1536, "height": 864},
+        {"width": 1280, "height": 720},
+        {"width": 1440, "height": 900}
+    ]
+    return random.choice(sizes)
+
+async def _set_stealth_measures(page: Page):
+    user_agent = get_random_user_agent()
+    viewport = get_random_viewport()
+    
+    # Set random user agent and viewport
+    await page.set_extra_http_headers({
+        "User-Agent": user_agent,
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1"
+    })
+    await page.set_viewport_size(viewport)
+    
+    # Hide automation traces
+    await page.evaluate_on_new_document("""
+        () => {
+            delete navigator.__proto__.webdriver;
+            Object.defineProperty(navigator, 'webdriver', {get: () => false});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
+            Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+        }
+    """)
+    
+    # Random mouse movements
+    await page.mouse.move(
+        random.randint(100, viewport["width"] - 100),
+        random.randint(100, viewport["height"] - 100)
+    )
+    await page.wait_for_timeout(random.randint(200, 500))
+    
+async def bypass_captcha(page: Page, debug: bool = False):
+    """Attempt to bypass CAPTCHA if detected"""
+    content = await page.content()
+    if "captcha" in content.lower() or "verify" in content.lower():
+        if debug:
+            print("CAPTCHA detected. Attempting bypass...")
+        
+        # Try to solve simple CAPTCHAs automatically
+        captcha_images = await page.query_selector_all('img[alt*="CAPTCHA"], img[alt*="captcha"]')
+        if captcha_images:
+            if debug:
+                print("Found CAPTCHA image. Trying to solve...")
+            try:
+                # Simple bypass attempt - might work for basic challenges
+                await page.wait_for_timeout(3000)
+                await page.reload()
+                await page.wait_for_timeout(2000)
+                return True
+            except:
+                pass
+        
+        # If still blocked, use a different approach
+        await page.wait_for_timeout(5000)  # Wait for manual solve (not possible in CI)
+        return False
+    return True
+
+async def collect_listing_urls_from_search(
+    context: BrowserContext,
+    seed_url: str,
+    max_listings: int = 20,
+    debug: bool = False,
+) -> List[str]:
+    page = await context.new_page()
+    try:
+        await _set_stealth_measures(page)
+        
+        if debug:
+            print(f"[debug] Opening search page: {seed_url}")
+
+        try:
+            # Use referrer to appear more natural
+            await page.goto("https://www.google.com", wait_until="domcontentloaded", timeout=10000)
+            await page.wait_for_timeout(random.randint(1000, 3000))
+            
+            # Navigate to target with random delay
+            await page.goto(seed_url, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_load_state("networkidle", timeout=30000)
+            await page.wait_for_timeout(random.randint(1000, 3000))
+        except Exception as e:
+            if debug:
+                print(f"[debug] Navigation error: {e}")
+            return []
+
+        # Check and handle CAPTCHA
+        if not await bypass_captcha(page, debug):
+            if debug:
+                print("CAPTCHA bypass failed. Skipping seed.")
+            return []
+
+
+
+
 def _normalize_url(href: str) -> str:
     if not href:
         return href
