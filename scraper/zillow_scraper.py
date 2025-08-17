@@ -54,10 +54,9 @@ async def collect_listing_urls_from_search(
     try:
         await _set_anti_bot_headers(page)
         await page.set_viewport_size({"width": 1366, "height": 768})
-        await page.set_user_agent(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
+        await page.set_extra_http_headers({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+})
 
         try:
             await page.goto(seed_url, wait_until="domcontentloaded", timeout=30000)
