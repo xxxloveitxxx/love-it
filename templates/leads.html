@@ -1,56 +1,41 @@
-<!doctype html>
+<!DOCTYPE html>
 <html>
-  <head>
-    <meta charset="utf-8" />
-    <title>Leads (Zillow)</title>
-    <script src="https://unpkg.com/htmx.org@1.9.12"></script>
-    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
-  </head>
-  <body class="p-6 max-w-6xl mx-auto">
-    <h1 class="text-2xl font-bold mb-4">Real Estate Leads (Zillow)</h1>
-
-    <div class="flex items-center gap-2">
-      <input id="city" class="border rounded px-3 py-2" placeholder="city-slug e.g. los-angeles-ca" value="los-angeles-ca">
-      <input id="limit" type="number" class="border rounded px-3 py-2 w-28" value="10" min="1" max="50">
-      <button
-        class="bg-blue-600 text-white px-4 py-2 rounded"
-        hx-post="/scrape"
-        hx-target="#status"
-        hx-vals='js:{"city": document.getElementById("city").value, "limit": document.getElementById("limit").value}'
-        hx-headers='{"Content-Type": "application/json"}'
-        hx-trigger="click">Scrape Now</button>
-      <div id="status" class="ml-3 text-sm text-gray-600"></div>
-    </div>
-
-    <div class="mt-6 overflow-x-auto">
-      <table class="min-w-full border">
-        <thead class="bg-gray-50">
-          <tr>
-            <th class="px-3 py-2 text-left">Name</th>
-            <th class="px-3 py-2 text-left">City</th>
-            <th class="px-3 py-2 text-left">Brokerage</th>
-            <th class="px-3 py-2 text-left">Last Sale</th>
-            <th class="px-3 py-2 text-left">Contact</th>
-            <th class="px-3 py-2 text-left">Created</th>
-          </tr>
+<head>
+    <title>Leads Dashboard</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        table { border-collapse: collapse; width: 100%; }
+        th, td { border: 1px solid #ddd; padding: 8px; }
+        th { background-color: #f4f4f4; text-align: left; }
+    </style>
+</head>
+<body>
+    <h2>Real Estate Leads</h2>
+    <table>
+        <thead>
+            <tr>
+                <th>Name</th>
+                <th>City</th>
+                <th>Brokerage</th>
+                <th>Last Sale</th>
+                <th>Contact</th>
+                <th>Source</th>
+                <th>Created</th>
+            </tr>
         </thead>
         <tbody>
-          {% for lead in leads %}
-          <tr class="border-t">
-            <td class="px-3 py-2">{{ lead.name }}</td>
-            <td class="px-3 py-2">{{ lead.city }}</td>
-            <td class="px-3 py-2">{{ lead.brokerage }}</td>
-            <td class="px-3 py-2">{{ lead.last_sale }}</td>
-            <td class="px-3 py-2">
-              {% if lead.contact_link %}
-                <a class="text-blue-600 underline" href="{{ lead.contact_link }}" target="_blank" rel="noopener">contact</a>
-              {% endif %}
-            </td>
-            <td class="px-3 py-2">{{ lead.created_at }}</td>
-          </tr>
-          {% endfor %}
+            {% for lead in leads %}
+            <tr>
+                <td>{{ lead.name }}</td>
+                <td>{{ lead.city }}</td>
+                <td>{{ lead.brokerage }}</td>
+                <td>{{ lead.last_sale }}</td>
+                <td><a href="{{ lead.contact_link }}" target="_blank">View</a></td>
+                <td>{{ lead.source }}</td>
+                <td>{{ lead.created_at }}</td>
+            </tr>
+            {% endfor %}
         </tbody>
-      </table>
-    </div>
-  </body>
+    </table>
+</body>
 </html>
