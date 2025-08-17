@@ -57,6 +57,8 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          python -m playwright install --with-deps
+
 
       - name: Install Playwright browsers + deps
         # installs browser binaries and native deps used by Playwright
