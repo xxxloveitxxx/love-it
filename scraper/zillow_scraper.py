@@ -1,3 +1,15 @@
+# scraper/zillow_scraper.py — add this at the very top of the file
+
+from typing import Dict, List, Optional
+import re
+import urllib.parse
+import asyncio
+import random
+import time
+
+from playwright.async_api import async_playwright, TimeoutError as PWTimeoutError
+
+
 async def _extract_listing_data(page, url: str, debug: bool=False) -> Dict:
     """Best-effort extraction of agent/name/city/brokerage/last_sale from a listing page.
        Also tries to follow an agent/profile link if present to extract email/brokerage.
