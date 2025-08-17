@@ -1,0 +1,10 @@
+Flask==3.0.3
+gunicorn==22.0.0
+Jinja2==3.1.4
+htmx==0.0.0  # (we load via CDN; placeholder to document)
+playwright==1.45.0
+supabase==2.6.0
+python-dotenv==1.0.1
+pandas==2.2.2
+gspread==6.0.2
+google-auth==2.35.0
