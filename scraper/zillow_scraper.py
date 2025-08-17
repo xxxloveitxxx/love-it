@@ -1,22 +1,28 @@
 # scraper/zillow_scraper.py
 """
-Async Zillow scraper using Playwright async API.
+Async Zillow scraper using Playwright.
 
-Call:
-    leads = await run_scrape(search_urls=[...], max_properties=10, headless=True)
+Usage:
+    from scraper.zillow_scraper import run_scrape
+    leads = await run_scrape(search_urls=[...], max_properties=6, headless=True, debug=True)
 
-Returns:
-    list[dict] with keys: name, city, email, brokerage, last_sale, source, url
+Notes:
+ - This is best-effort scraping of public listing pages.
+ - It scrolls the search page to load more cards, collects anchors with '/homedetails/' or '/homedetails' in href,
+   then opens each listing and extracts a few fields (best-effort).
+ - It intentionally uses random short delays and a conservative max_properties to reduce load.
 """
 import os
 import asyncio
-from typing import List, Dict, Optional
+import random
+from typing import List, Dict, Optional, Set
 from urllib.parse import urljoin
 
 from playwright.async_api import async_playwright, TimeoutError as PWTimeoutError
 
 DEFAULT_SEEDS = [
-    "https://www.zillow.com/homes/for_sale/"
+    "https://www.zillow.com/homes/for_sale/San-Francisco-CA_rb/",
+    "https://www.zillow.com/homes/for_sale/Los-Angeles-CA_rb/",
 ]
 
 def _get_seed_urls(provided: Optional[List[str]] = None) -> List[str]:
@@ -35,97 +41,157 @@ def _normalize_url(href: Optional[str]) -> Optional[str]:
         return urljoin("https://www.zillow.com", href)
     return href
 
-async def _collect_listing_links_from_search_page(page, max_links: int) -> List[str]:
+async def _scroll_and_collect_links(page, max_links_per_seed: int, debug: bool=False) -> List[str]:
+    """Scroll the search page to load listings and collect listing links."""
     links: List[str] = []
-    try:
-        # heuristics for common listing anchors
-        anchors = await page.query_selector_all("a[href*='/homedetails/'], a.list-card-link, a.zsg-photo-card-overlay-link")
+    seen: Set[str] = set()
+
+    # How many scrolls to try (conservative)
+    max_scrolls = 10
+    for i in range(max_scrolls):
+        if debug:
+            print(f"[debug] scroll pass {i+1}/{max_scrolls}")
+
+        # collect anchors likely pointing to listing pages
+        anchors = await page.query_selector_all("a")
         for a in anchors:
-            href = await a.get_attribute("href")
+            try:
+                href = await a.get_attribute("href")
+            except Exception:
+                href = None
+            if not href:
+                continue
             href = _normalize_url(href)
             if not href:
                 continue
-            if href not in links:
-                links.append(href)
-            if len(links) >= max_links:
-                break
-    except Exception:
-        pass
+            # Zillow listing pages commonly contain '/homedetails/' or contain '_zpid' or '/homedetails'
+            if ("/homedetails/" in href) or ("_zpid" in href and "homedetails" in href) or "/b/" in href:
+                if href not in seen:
+                    seen.add(href)
+                    links.append(href)
+                    if debug:
+                        print(f"[debug] found {href}")
+                    if len(links) >= max_links_per_seed:
+                        return links
 
-    # fallback scan
-    if not links:
+        # scroll a bit to load more results
         try:
-            anchors = await page.query_selector_all("a")
-            for a in anchors:
-                href = await a.get_attribute("href")
-                if href and "/homedetails/" in href:
-                    href = _normalize_url(href)
-                    if href and href not in links:
-                        links.append(href)
-                    if len(links) >= max_links:
-                        break
+            await page.evaluate(
+                """() => {
+                    window.scrollBy(0, Math.max(document.body.clientHeight, 800));
+                }"""
+            )
         except Exception:
             pass
 
+        # wait a bit (randomized) for JS to load more cards
+        await asyncio.sleep(1.0 + random.random() * 1.5)
+
     return links
 
-async def _extract_listing_data(page, url: str) -> Dict:
+async def _extract_listing_data(page, url: str, debug: bool=False) -> Dict:
+    """Best-effort extraction of agent/name/city/brokerage/last_sale from a listing page."""
     name = None
     city = None
     brokerage = None
     email = None
     last_sale = None
 
+    # Wait for a main address or header to appear (if blocked this may timeout)
     try:
-        addr_el = await page.query_selector("h1, .ds-address-container, .zsg-content-header, .ds-address")
-        if addr_el:
-            city = (await addr_el.inner_text()).strip()
+        # try a few useful selectors
+        await page.wait_for_timeout(500)  # give the page a moment
+        # address / title - common patterns
+        for sel in ["h1", ".ds-address-container", "h1.ds-address-container", ".zsg-content-header", ".StyledPropertyCardData"]:
+            try:
+                el = await page.query_selector(sel)
+                if el:
+                    text = (await el.inner_text()).strip()
+                    if text:
+                        city = text
+                        if debug:
+                            print(f"[debug] address/title ({sel}): {text}")
+                        break
+            except Exception:
+                continue
 
-        agent_sel_variants = [
-            "a.ds-agent-name",
-            ".listing-agent-name",
-            ".zsg-agent-name",
-            ".ds-listing-agent-title a",
-            "text=Listing by"
+        # agent / listing by
+        agent_selectors = [
+            "a.ds-agent-name", "text=Listing by", ".ds-listing-agent-title", '[data-testid="listing-agent-name"]',
+            ".listing-agent-name", ".zsg-agent-name", ".agent-name"
         ]
-        for sel in agent_sel_variants:
+        for sel in agent_selectors:
             try:
                 el = await page.query_selector(sel)
                 if el:
                     text = (await el.inner_text()).strip()
                     if text:
                         name = text
+                        if debug:
+                            print(f"[debug] agent ({sel}): {text}")
                         break
             except Exception:
                 continue
 
-        brokerage_sel_variants = [
-            ".ds-listing-agent-company", ".zsg-agent-company", ".agent-company"
+        # brokerage/company
+        brokerage_selectors = [
+            ".ds-listing-agent-company", ".agent-company", '[data-testid="brokerage-name"]', ".listing-agent-company"
         ]
-        for sel in brokerage_sel_variants:
+        for sel in brokerage_selectors:
             try:
                 el = await page.query_selector(sel)
                 if el:
-                    brokerage = (await el.inner_text()).strip()
-                    break
+                    text = (await el.inner_text()).strip()
+                    if text:
+                        brokerage = text
+                        if debug:
+                            print(f"[debug] brokerage ({sel}): {text}")
+                        break
             except Exception:
                 continue
 
-        # last sale / sold info - try searching for "Last sold" text nodes, best-effort
-        try:
-            sold_el = await page.query_selector("text=Last sold")
-            if sold_el:
-                # get parent or surrounding
-                parent = await sold_el.evaluate_handle("node => node.parentElement || node")
-                last_sale = (await (await parent.get_property("innerText")).json_value()).strip()
-        except Exception:
-            pass
+        # last sale / sold info
+        sold_keywords = ["Last sold", "Sold for", "Last sold for", "Sold on"]
+        page_text = await page.content()
+        # quick best-effort search for a short snippet
+        for kw in sold_keywords:
+            if kw in page_text:
+                # find a surrounding chunk
+                try:
+                    # prefer a visible element containing the keyword
+                    handles = await page.query_selector_all(f"text={kw}")
+                    if handles:
+                        h = handles[0]
+                        parent = await h.evaluate_handle("node => node.parentElement || node")
+                        last_sale_text = await (await parent.get_property("innerText")).json_value()
+                        last_sale = last_sale_text.strip()
+                    else:
+                        # fallback to content search: extract substring
+                        idx = page_text.find(kw)
+                        snippet = page_text[max(0, idx-100): idx+200]
+                        last_sale = " ".join(snippet.split())[:400]
+                    if debug and last_sale:
+                        print(f"[debug] last_sale found near '{kw}': {last_sale[:120]}")
+                    break
+                except Exception:
+                    continue
 
-        # Zillow normally doesn't reveal emails publicly
-        email = None
+        # Emails are rarely on Zillow public pages. But try to find an @ in page text (best-effort)
+        if "@" in page_text:
+            # very naive: find first token with @
+            import re
+            m = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", page_text)
+            if m:
+                email = m.group(0)
+                if debug:
+                    print(f"[debug] found possible email: {email}")
 
-    except Exception:
-        pass
+    except PWTimeoutError:
+        if debug:
+            print("[debug] Timeout waiting on page content")
+    except Exception as e:
+        if debug:
+            print("[debug] extraction error:", e)
 
     return {
         "name": name,
@@ -141,55 +207,97 @@ async def run_scrape(
     search_urls: Optional[List[str]] = None,
     max_properties: int = 6,
     headless: bool = True,
+    debug: bool = False,
 ) -> List[Dict]:
     """
-    Async run_scrape that your runner can await.
+    Async run_scrape.
 
     Args:
-        search_urls: optional list of search pages to start from. If None, uses env or defaults.
-        max_properties: total number of property pages to scrape across seeds.
-        headless: run headless browser if True.
+      search_urls: list of seed search pages.
+      max_properties: total number of listing pages to visit across seeds.
+      headless: run headless or not.
+      debug: print debug logs.
 
     Returns:
-        list of lead dicts.
+      list of lead dicts.
     """
     seeds = _get_seed_urls(search_urls)
-    results: List[Dict] = []
-    per_seed_limit = max(1, max_properties)
+    results = []
+    per_seed_limit = max(1, max_properties)  # we'll limit globally as well
+
+    pw_args = ["--no-sandbox", "--disable-dev-shm-usage"]
+    if debug:
+        print(f"[debug] seeds: {seeds}, max_properties: {max_properties}, headless: {headless}")
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=headless, args=["--no-sandbox"])
-        context = await browser.new_context()
+        browser = await p.chromium.launch(headless=headless, args=pw_args)
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/120.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 800},
+            locale="en-US",
+            timezone_id="America/Los_Angeles",
+        )
         page = await context.new_page()
 
         for seed in seeds:
             if len(results) >= max_properties:
                 break
             try:
-                await page.goto(seed, timeout=30000)
+                if debug:
+                    print(f"[debug] goto seed: {seed}")
+                await page.goto(seed, wait_until="networkidle", timeout=30000)
             except PWTimeoutError:
+                if debug:
+                    print("[debug] seed load timed out, continuing")
                 continue
-            except Exception:
+            except Exception as e:
+                if debug:
+                    print("[debug] seed load error:", e)
                 continue
 
-            # let dynamic content render
-            await asyncio.sleep(2)
+            # small wait to allow client-side rendering
+            await asyncio.sleep(1.0 + random.random() * 1.5)
 
-            links = await _collect_listing_links_from_search_page(page, per_seed_limit)
+            # scroll the search results and collect links
+            links = await _scroll_and_collect_links(page, max_links_per_seed=per_seed_limit, debug=debug)
+            if debug:
+                print(f"[debug] collected {len(links)} listing links from seed")
+
             for link in links:
                 if len(results) >= max_properties:
                     break
-                try:
-                    await page.goto(link, timeout=30000)
-                except PWTimeoutError:
-                    continue
-                except Exception:
+                # skip duplicates
+                if any(r.get("url") == link for r in results):
                     continue
 
-                await asyncio.sleep(2)
-                lead = await _extract_listing_data(page, link)
+                # basic anti-block detection
+                url_lower = (link or "").lower()
+                if "captcha" in url_lower or "access-denied" in url_lower:
+                    if debug:
+                        print("[debug] skipping blocked url:", link)
+                    continue
+
+                try:
+                    if debug:
+                        print("[debug] visiting listing:", link)
+                    await page.goto(link, wait_until="networkidle", timeout=30000)
+                except PWTimeoutError:
+                    if debug:
+                        print("[debug] listing load timed out:", link)
+                    continue
+                except Exception as e:
+                    if debug:
+                        print("[debug] error loading listing:", e)
+                    continue
+
+                # best-effort extraction
+                lead = await _extract_listing_data(page, link, debug=debug)
                 results.append(lead)
-                await asyncio.sleep(1.0)
+
+                # polite delay between listing visits
+                await asyncio.sleep(1.2 + random.random() * 2.0)
 
         try:
             await context.close()
@@ -197,12 +305,12 @@ async def run_scrape(
         except Exception:
             pass
 
+    if debug:
+        print(f"[debug] finished; total leads: {len(results)}")
     return results
 
-# quick debug when invoked directly
+# run quick local test
 if __name__ == "__main__":
     import asyncio, json
-    seeds_env = os.getenv("ZILLOW_SEED_URLS")
-    seeds = [s.strip() for s in seeds_env.split(",")] if seeds_env else None
-    leads = asyncio.run(run_scrape(search_urls=seeds, max_properties=4, headless=True))
+    leads = asyncio.run(run_scrape(max_properties=4, headless=True, debug=True))
     print(json.dumps(leads, indent=2))
