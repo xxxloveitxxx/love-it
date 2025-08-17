@@ -1,33 +1,135 @@
-# scraper/zillow_scraper.py — add this at the very top of the file
-
+# scraper/zillow_scraper.py
 from typing import Dict, List, Optional
+import os
 import re
 import urllib.parse
 import asyncio
 import random
 import time
 
-from playwright.async_api import async_playwright, TimeoutError as PWTimeoutError
+from playwright.async_api import (
+    async_playwright,
+    Page,
+    BrowserContext,
+    TimeoutError as PWTimeoutError,
+)
 
+# -------------------------
+# helpers
+# -------------------------
+def _normalize_url(href: str) -> str:
+    """Turn a relative/protocol-relative href into an absolute zillow url."""
+    if not href:
+        return href
+    href = href.strip()
+    if href.startswith("//"):
+        return "https:" + href
+    if href.startswith("/"):
+        return urllib.parse.urljoin("https://www.zillow.com", href)
+    if href.startswith("http://") or href.startswith("https://"):
+        return href
+    return urllib.parse.urljoin("https://www.zillow.com", href)
 
 
 async def _set_anti_bot_headers(page: Page):
-    # realistic UA + headers to reduce bot fingerprinting
-    await page.set_extra_http_headers({
-        "accept-language": "en-US,en;q=0.9",
-    })
-    await page.evaluate(
-        """() => {
-            // override some navigator properties in-page (best-effort)
-            try {
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            } catch (e) {}
-        }"""
-    )
+    # small, best-effort anti-bot headers + properties
+    await page.set_extra_http_headers({"accept-language": "en-US,en;q=0.9"})
+    # try to nudge navigator.webdriver away (best-effort)
+    try:
+        await page.evaluate(
+            """() => {
+                try {
+                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                } catch(e) {}
+            }"""
+        )
+    except Exception:
+        pass
 
-async def _extract_listing_data(page, url: str, debug: bool=False) -> Dict:
-    """Best-effort extraction of agent/name/city/brokerage/last_sale from a listing page.
-       Also tries to follow an agent/profile link if present to extract email/brokerage.
+
+# -------------------------
+# collect listing URLs from a search page
+# -------------------------
+async def collect_listing_urls_from_search(
+    context: BrowserContext,
+    seed_url: str,
+    max_listings: int = 20,
+    debug: bool = False,
+) -> List[str]:
+    """
+    Visit a Zillow search/region page and return up to max_listings matching listing URLs.
+    """
+    page = await context.new_page()
+    try:
+        await _set_anti_bot_headers(page)
+        await page.set_viewport_size({"width": 1366, "height": 768})
+        await page.set_user_agent(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+
+        try:
+            await page.goto(seed_url, wait_until="domcontentloaded", timeout=30000)
+        except PWTimeoutError:
+            if debug:
+                print("[debug] initial goto timed out; retrying networkidle")
+            try:
+                await page.goto(seed_url, wait_until="networkidle", timeout=30000)
+            except Exception:
+                if debug:
+                    print("[debug] goto retry failed; continue and try to parse current DOM")
+
+        found = set()
+        start = time.time()
+        timeout_seconds = 20
+        last_count = 0
+
+        while len(found) < max_listings and (time.time() - start) < timeout_seconds:
+            try:
+                hrefs = await page.eval_on_selector_all("a", "els => els.map(e => e.href)")
+            except Exception:
+                hrefs = []
+
+            for href in (hrefs or []):
+                if not href:
+                    continue
+                low = href.lower()
+                if "zillow.com" in low and ("/homedetails/" in low or "zpid" in low):
+                    href_n = href.split("?")[0].rstrip("/")
+                    # normalize (strip tracking params)
+                    found.add(href_n)
+
+            # scroll a bit to trigger client-side loading
+            try:
+                await page.evaluate("window.scrollBy(0, window.innerHeight);")
+            except Exception:
+                pass
+
+            await page.wait_for_timeout(600 + random.randint(0, 800))
+
+            if len(found) == last_count:
+                # give an extra short wait and break
+                await page.wait_for_timeout(500)
+                break
+            last_count = len(found)
+
+        results = list(found)
+        if debug:
+            print(f"[debug] collect_listing_urls_from_search found {len(results)} urls (limit {max_listings})")
+        return results[:max_listings]
+    finally:
+        try:
+            await page.close()
+        except Exception:
+            pass
+
+
+# -------------------------
+# extract listing details (best-effort)
+# -------------------------
+async def _extract_listing_data(page: Page, url: str, debug: bool = False) -> Dict:
+    """
+    Extracts name/city/email/brokerage/last_sale from a listing page (best-effort).
     """
     name = None
     city = None
@@ -79,7 +181,7 @@ async def _extract_listing_data(page, url: str, debug: bool=False) -> Dict:
             except Exception:
                 continue
 
-        # best-effort last sale detection
+        # detect last sale by scanning page content
         sold_keywords = ["Last sold", "Sold for", "Last sold for", "Sold on"]
         page_text = await page.content()
         for kw in sold_keywords:
@@ -93,7 +195,7 @@ async def _extract_listing_data(page, url: str, debug: bool=False) -> Dict:
                         last_sale = last_sale_text.strip()
                     else:
                         idx = page_text.find(kw)
-                        snippet = page_text[max(0, idx-120): idx+200]
+                        snippet = page_text[max(0, idx - 120) : idx + 200]
                         last_sale = " ".join(snippet.split())[:400]
                     if debug and last_sale:
                         print(f"[debug] last_sale near '{kw}': {last_sale[:120]}")
@@ -101,7 +203,7 @@ async def _extract_listing_data(page, url: str, debug: bool=False) -> Dict:
                 except Exception:
                     continue
 
-        # if listing page contains a mailto link, capture it right away
+        # if listing page contains a mailto link, capture it
         mail_el = await page.query_selector('a[href^="mailto:"]')
         if mail_el:
             try:
@@ -113,7 +215,7 @@ async def _extract_listing_data(page, url: str, debug: bool=False) -> Dict:
             except Exception:
                 pass
 
-        # If no email found, try to locate an agent/profile link on the listing
+        # follow agent profile if present for more info
         if not email:
             agent_link = None
             anchors = await page.query_selector_all("a")
@@ -125,11 +227,9 @@ async def _extract_listing_data(page, url: str, debug: bool=False) -> Dict:
                 if not href:
                     continue
                 href_l = href.lower()
-                # patterns where Zillow exposes an agent profile
                 if "zillow.com/profile" in href_l or "/agent/" in href_l or "/profile/" in href_l or "/agents/" in href_l:
                     agent_link = href
                     break
-                # sometimes the agent anchor text includes 'Agent' and the href is relative
                 txt = (await a.inner_text()) or ""
                 if "agent" in txt.lower() and href_l and href_l.startswith("/"):
                     agent_link = href
@@ -140,7 +240,6 @@ async def _extract_listing_data(page, url: str, debug: bool=False) -> Dict:
                 if debug:
                     print("[debug] following agent link:", agent_link)
                 try:
-                    # open a new page for agent profile to avoid changing the listing page state
                     context = page.context
                     agent_page = await context.new_page()
                     try:
@@ -148,7 +247,7 @@ async def _extract_listing_data(page, url: str, debug: bool=False) -> Dict:
                         await agent_page.wait_for_timeout(800)
                         content = await agent_page.content()
 
-                        # try to find mailto on agent profile
+                        # mailto on agent profile
                         mail_el = await agent_page.query_selector('a[href^="mailto:"]')
                         if mail_el:
                             try:
@@ -162,7 +261,6 @@ async def _extract_listing_data(page, url: str, debug: bool=False) -> Dict:
 
                         # try plain-text email via regex
                         if not email and "@" in content:
-                            import re
                             m = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", content)
                             if m:
                                 email = m.group(0)
@@ -170,7 +268,7 @@ async def _extract_listing_data(page, url: str, debug: bool=False) -> Dict:
                                     print(f"[debug] agent profile possible email: {email}")
 
                         # try to extract brokerage/company on agent page
-                        for sel in [".brokerage", ".company", ".agent-company", ".agent-brokerage", '.agent-company-name']:
+                        for sel in [".brokerage", ".company", ".agent-company", ".agent-brokerage", ".agent-company-name"]:
                             try:
                                 el = await agent_page.query_selector(sel)
                                 if el:
@@ -211,7 +309,6 @@ async def _extract_listing_data(page, url: str, debug: bool=False) -> Dict:
         if not email:
             page_text = await page.content()
             if "@" in page_text:
-                import re
                 m = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", page_text)
                 if m:
                     email = m.group(0)
@@ -231,140 +328,106 @@ async def _extract_listing_data(page, url: str, debug: bool=False) -> Dict:
         "source": "zillow",
         "url": url,
     }
-# scraper/zillow_scraper.py  (append this below your _extract_listing_data)
 
-from typing import Dict, List, Optional
-import random
-import asyncio
-from playwright.async_api import async_playwright
 
-DEFAULT_SEEDS = [
-    "https://www.zillow.com/homes/for_sale/San-Francisco-CA_rb/",
-    "https://www.zillow.com/homes/for_sale/Los-Angeles-CA_rb/",
-]
-
-async def _gather_listing_urls_from_search(page, search_url: str, max_links: int = 20, debug: bool=False) -> List[str]:
-    """Open a search page and return a deduped list of listing URLs (homedetails etc.)."""
-    try:
-        await page.goto(search_url, wait_until="networkidle", timeout=30000)
-    except Exception:
-        try:
-            await page.goto(search_url, wait_until="load", timeout=30000)
-        except Exception:
-            if debug: print("[debug] failed to open search url:", search_url)
-            return []
-
-    # small wait so dynamic content has time to load
-    await page.wait_for_timeout(1000 + random.randint(0, 1000))
-
-    anchors = await page.query_selector_all("a")
-    found = []
-    for a in anchors:
-        try:
-            href = await a.get_attribute("href")
-        except Exception:
-            href = None
-        if not href:
-            continue
-        href = href.split("#")[0]
-        lower = href.lower()
-        # Zillow listings commonly use /homedetails/ in the path; sometimes /b/ or /homedetails
-        if "/homedetails/" in lower or "/b/" in lower and "homedetails" not in lower:
-            url = _normalize_url(href)
-            if url not in found:
-                found.append(url)
-        # also include explicit /profile/ or /agent/ links? we only want listing pages here
-        if len(found) >= max_links:
-            break
-    if debug: print(f"[debug] found {len(found)} listing urls on {search_url}")
-    return found
-
-async def run_scrape(search_urls: List[str]=None, max_per_seed:int=6, max_listings:int=20, debug: bool=False) -> List[dict]:
+# -------------------------
+# main run function
+# -------------------------
+async def run_scrape(
+    search_urls: Optional[List[str]] = None,
+    max_total: Optional[int] = None,
+    max_per_search: Optional[int] = None,
+    debug: bool = False,
+) -> List[Dict]:
     """
-    Main entrypoint expected by scripts/run_scraper.py.
-    - search_urls: list of Zillow search pages to seed from. If None, uses DEFAULT_SEEDS.
-    - max_per_seed: how many listing pages to scrape per seed (keeps volume low).
-    - max_listings: global cap (safety).
+    Entry point used by your runner. Returns a list of lead dicts.
     """
-    if search_urls is None:
-        search_urls = DEFAULT_SEEDS
+    # load defaults from env if not provided
+    search_urls = search_urls or os.getenv("ZILLOW_SEED_URLS", "")
+    if isinstance(search_urls, str):
+        if not search_urls:
+            # default example city searches
+            seed_defaults = [
+                "https://www.zillow.com/homes/for_sale/San-Francisco-CA_rb/",
+                "https://www.zillow.com/homes/for_sale/Los-Angeles-CA_rb/",
+            ]
+            search_urls = seed_defaults
+        else:
+            search_urls = [s.strip() for s in search_urls.split(",") if s.strip()]
 
-    results = []
-    visited = set()
-    sem = asyncio.Semaphore(3)  # concurrency limit for scraping listing pages
+    max_per_search = int(max_per_search or os.getenv("MAX_LISTINGS_PER_SEARCH", "6"))
+    max_total = int(max_total or os.getenv("MAX_LISTINGS_TOTAL", "12"))
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                       "(KHTML, like Gecko) Chrome/120 Safari/537.36",
-            viewport={"width": 1280, "height": 800},
-        )
-
-        # single page to collect listing urls
-        base_page = await context.new_page()
+    leads: List[Dict] = []
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+        context = await browser.new_context()
 
         try:
-            listing_candidates = []
+            # collect listing URLs
+            collected_urls: List[str] = []
             for seed in search_urls:
-                try:
-                    urls = await _gather_listing_urls_from_search(base_page, seed, max_links=max_per_seed*3, debug=debug)
-                    # limit per seed
-                    listing_candidates.extend(urls[:max_per_seed])
-                except Exception as e:
-                    if debug: print("[debug] error gathering from seed", seed, ":", e)
-                # random pause between seeds to reduce fingerprint
-                await base_page.wait_for_timeout(800 + random.randint(0,800))
-
-            # dedupe & limit globally
-            deduped = []
-            for u in listing_candidates:
-                if u not in visited:
-                    visited.add(u)
-                    deduped.append(u)
-                if len(deduped) >= max_listings:
+                if len(collected_urls) >= max_total:
                     break
+                try:
+                    urls = await collect_listing_urls_from_search(context, seed, max_per_search, debug=debug)
+                except Exception as e:
+                    if debug:
+                        print("[debug] collect_listing_urls_from_search error:", e)
+                    urls = []
+                for u in urls:
+                    if len(collected_urls) >= max_total:
+                        break
+                    if u not in collected_urls:
+                        collected_urls.append(u)
 
-            if debug: print(f"[debug] will scrape {len(deduped)} listings")
+            if debug:
+                print(f"[debug] will scrape {len(collected_urls)} listings")
 
-            async def _scrape_one(url):
-                async with sem:
+            # visit each listing and extract details
+            for i, url in enumerate(collected_urls):
+                if len(leads) >= max_total:
+                    break
+                try:
                     page = await context.new_page()
+                    await _set_anti_bot_headers(page)
+                    await page.set_viewport_size({"width": 1366, "height": 768})
+                    await page.set_user_agent(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                    )
                     try:
-                        await page.goto(url, wait_until="networkidle", timeout=25000)
+                        await page.goto(url, wait_until="networkidle", timeout=20000)
                     except Exception:
                         try:
-                            await page.goto(url, wait_until="load", timeout=25000)
-                        except Exception as e:
-                            if debug: print("[debug] failed to open listing", url, e)
+                            await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                        except Exception:
+                            if debug:
+                                print(f"[debug] failed to open listing {url}")
                             await page.close()
-                            return None
+                            continue
 
-                    # small random delay to mimic human browsing
-                    await page.wait_for_timeout(600 + random.randint(0, 800))
-                    try:
-                        data = await _extract_listing_data(page, url, debug=debug)
-                    except Exception as e:
-                        if debug: print("[debug] extract failed for", url, e)
-                        data = None
-                    try:
-                        await page.close()
-                    except Exception:
-                        pass
-                    return data
+                    lead = await _extract_listing_data(page, url, debug=debug)
+                    if lead:
+                        leads.append(lead)
+                        if debug:
+                            print("[debug] scraped lead:", {k: v for k, v in lead.items() if k in ("name", "email", "city")})
+                    await page.close()
 
-            tasks = [asyncio.create_task(_scrape_one(u)) for u in deduped]
-            completed = await asyncio.gather(*tasks)
-            for item in completed:
-                if item:
-                    results.append(item)
-
+                    # small human-like pause
+                    await asyncio.sleep(0.8 + random.random() * 0.6)
+                except Exception as e:
+                    if debug:
+                        print("[debug] per-listing error:", e)
+                    continue
         finally:
             try:
-                await base_page.close()
+                await context.close()
             except Exception:
                 pass
-            await context.close()
-            await browser.close()
+            try:
+                await browser.close()
+            except Exception:
+                pass
 
-    return results
+    return leads
