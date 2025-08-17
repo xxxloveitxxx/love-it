@@ -1,593 +1,346 @@
-# scraper/zillow_scraper.py
-from typing import Dict, List, Optional
+# scraper/realtor_scraper.py
+"""
+Lightweight Realtor.com scraper.
+- Uses requests + BeautifulSoup (no Playwright).
+- Extracts listing URLs from a search page and parses JSON-LD (preferred).
+- Polite: randomized User-Agent + delays.
+- Does NOT attempt to bypass CAPTCHAs or anti-bot measures.
+"""
+
+from typing import List, Dict, Optional
 import os
-import re
-import urllib.parse
-import asyncio
-import random
 import time
+import random
 import json
-import sys
+from urllib.parse import urljoin, urlparse
+import requests
+from bs4 import BeautifulSoup
 
-from playwright.async_api import (
-    async_playwright,
-    Page,
-    BrowserContext,
-    TimeoutError as PWTimeoutError,
-)
+# --- config / helpers ----------------------------------------------------
 
-# -------------------------
-# Helpers
-# -------------------------
+DEFAULT_USER_AGENTS = [
+    # modern browser user agents
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+]
 
-def _normalize_url(href: str) -> str:
-    if not href:
-        return href
-    href = href.strip()
-    if href.startswith("//"):
-        return "https:" + href
-    if href.startswith("/"):
-        return urllib.parse.urljoin("https://www.zillow.com", href)
-    if href.startswith("http://") or href.startswith("https://"):
-        return href
-    return urllib.parse.urljoin("https://www.zillow.com", href)
+HEADERS_BASE = {
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+}
 
-def get_random_user_agent() -> str:
-    agents = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-    ]
-    return random.choice(agents)
+REQUEST_TIMEOUT = 15.0
 
-def get_random_viewport() -> Dict:
-    sizes = [
-        {"width": 1366, "height": 768},
-        {"width": 1920, "height": 1080},
-        {"width": 1536, "height": 864},
-        {"width": 1280, "height": 720},
-        {"width": 1440, "height": 900},
-    ]
-    return random.choice(sizes)
 
-def extract_json_ld(page_content: str) -> List[Dict]:
-    """Extract structured JSON-LD data from page source"""
-    pattern = re.compile(r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', re.DOTALL | re.IGNORECASE)
-    matches = pattern.findall(page_content)
-    results = []
-    for match in matches:
+def get_headers():
+    h = HEADERS_BASE.copy()
+    h["User-Agent"] = random.choice(DEFAULT_USER_AGENTS)
+    return h
+
+
+def extract_json_ld(html: str) -> List[Dict]:
+    """Return JSON-LD objects found on the page (best-effort)."""
+    out = []
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup.find_all("script", {"type": "application/ld+json"}):
+        txt = tag.string
+        if not txt:
+            continue
         try:
-            clean_match = match.replace('/*<![CDATA[*/', '').replace('/*]]>*/', '')
-            data = json.loads(clean_match.strip())
-            results.append(data)
-        except json.JSONDecodeError:
+            data = json.loads(txt)
+            out.append(data)
+        except Exception:
+            # Sometimes JSON-LD contains multiple objects or trailing commas; try to safely load pieces
             try:
-                data = json.loads("[" + clean_match.strip().rstrip(",") + "]")
-                results.extend(data)
+                cleaned = txt.strip()
+                # if it's a list
+                if cleaned.startswith("["):
+                    data = json.loads(cleaned)
+                    if isinstance(data, list):
+                        out.extend(data)
+                else:
+                    # sometimes there are multiple JSON objects concatenated; split heuristically
+                    for part in cleaned.split("\n"):
+                        part = part.strip()
+                        if not part:
+                            continue
+                        try:
+                            parsed = json.loads(part)
+                            out.append(parsed)
+                        except Exception:
+                            continue
             except Exception:
                 continue
-    return results
+    return out
 
-# -------------------------
-# Playwright helpers
-# -------------------------
 
-async def _apply_stealth_on_new_doc(page: Page):
-    # Use add_init_script (Playwright Python) to inject before any script runs
-    script = """
-    () => {
-        try {
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
-            Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
-        } catch(e) {}
-    }
-    """
-    # add_init_script is the Python API equivalent of evaluate_on_new_document
-    await page.add_init_script(script)
+# --- listing discovery ---------------------------------------------------
 
-async def _set_page_headers_and_viewport(page: Page, debug: bool = False):
-    ua = get_random_user_agent()
-    viewport = get_random_viewport()
-    try:
-        await page.set_extra_http_headers({
-            "User-Agent": ua,
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
-        })
-    except Exception:
-        if debug:
-            print("[debug] set_extra_http_headers failed")
-
-    try:
-        await page.set_viewport_size(viewport)
-    except Exception:
-        if debug:
-            print("[debug] set_viewport_size failed")
-
-    try:
-        await page.mouse.move(random.randint(50, viewport["width"] - 50), random.randint(50, viewport["height"] - 50))
-    except Exception:
-        pass
-
-async def bypass_captcha(page: Page, debug: bool = False) -> bool:
-    """Detect simple captcha/interstitial content and try light handling. Return True if page is OK."""
-    content = (await page.content()).lower()
-    if "captcha" in content or "verify" in content or "are you a human" in content:
-        if debug:
-            print("[debug] CAPTCHA / anti-bot content detected in page content.")
-        try:
-            await page.reload(timeout=8000)
-            await page.wait_for_timeout(1500)
-        except Exception:
-            pass
-        content2 = (await page.content()).lower()
-        if "captcha" in content2 or "verify" in content2:
-            if debug:
-                print("[debug] Aborting collect: captcha detected.")
-            return False
-    return True
-
-# -------------------------
-# Collect listing URLs from a Zillow search page
-# -------------------------
-
-async def collect_listing_urls_from_search(
-    context: BrowserContext,
-    seed_url: str,
-    max_listings: int = 20,
+def collect_listing_urls_from_search(
+    search_url: str,
+    limit: int = 12,
     debug: bool = False,
 ) -> List[str]:
-    page = await context.new_page()
+    """
+    Extract listing detail URLs from a Realtor search page.
+    - Prefer JSON-LD sources.
+    - Fallback to anchor href scanning for known path segments.
+    """
+    if debug:
+        print("[realtor] fetching search page:", search_url)
     try:
-        await _apply_stealth_on_new_doc(page)
-        await _set_page_headers_and_viewport(page, debug=debug)
-
-        if debug:
-            print(f"[debug] Opening search page: {seed_url}")
-
-        try:
-            await page.goto(seed_url, wait_until="domcontentloaded", timeout=30000)
-            try:
-                await page.wait_for_load_state("networkidle", timeout=20000)
-            except Exception:
-                pass
-            await page.wait_for_timeout(random.randint(800, 1800))
-        except Exception as e:
-            if debug:
-                print(f"[debug] Navigation error: {e}")
-            return []
-
-        ok = await bypass_captcha(page, debug=debug)
-        if not ok:
-            return []
-
-        found = set()
-
-        # attempt 1: JSON-LD
-        page_content = await page.content()
-        json_ld_data = extract_json_ld(page_content)
-        if debug:
-            print(f"[debug] Found {len(json_ld_data)} JSON-LD objects")
-        for data in json_ld_data:
-            try:
-                if isinstance(data, dict) and data.get("@type") in ("ListItem", "Offer", "ItemList"):
-                    if data.get("url"):
-                        url = _normalize_url(data["url"])
-                        if "zillow.com/homedetails/" in url or "homedetails" in url:
-                            found.add(url)
-                    for k in ("itemListElement", "itemlistelement"):
-                        if k in data and isinstance(data[k], list):
-                            for it in data[k]:
-                                u = None
-                                if isinstance(it, dict) and it.get("url"):
-                                    u = it.get("url")
-                                elif isinstance(it, dict) and it.get("item") and isinstance(it.get("item"), dict):
-                                    u = it["item"].get("url")
-                                if u:
-                                    u = _normalize_url(u)
-                                    if "zillow.com/homedetails/" in u:
-                                        found.add(u)
-            except Exception:
-                continue
-
-        # attempt 2: window state
-        if not found:
-            try:
-                state = await page.evaluate("() => (window.__initialState__ || window.appState || window.__REDUX_STATE__ || {})")
-                if state:
-                    def scan_obj(o):
-                        urls = []
-                        if isinstance(o, dict):
-                            for k, v in o.items():
-                                if isinstance(v, str) and ("zillow.com/homedetails" in v or "/homedetails/" in v):
-                                    urls.append(_normalize_url(v))
-                                else:
-                                    urls.extend(scan_obj(v))
-                        elif isinstance(o, list):
-                            for item in o:
-                                urls.extend(scan_obj(item))
-                        return urls
-                    found_urls = scan_obj(state)
-                    for u in found_urls:
-                        if "zillow.com/homedetails/" in u:
-                            found.add(u)
-                if debug:
-                    print(f"[debug] Found {len(found)} URLs from state")
-            except Exception:
-                if debug:
-                    print("[debug] State extraction error (ignored)")
-
-        # attempt 3: DOM fallback
-        if not found:
-            if debug:
-                print("[debug] Using DOM fallback for URLs")
-            try:
-                listing_selector = 'a[href*="/homedetails/"], a[data-testid*="property-card-link"], a[class*="property-card"]'
-                await page.evaluate("window.scrollTo(0, 600)")
-                await page.wait_for_timeout(700)
-                links = await page.query_selector_all(listing_selector)
-                for link in links:
-                    try:
-                        href = await link.get_attribute("href")
-                    except Exception:
-                        href = None
-                    if href:
-                        normalized = _normalize_url(href)
-                        if "zillow.com/homedetails/" in normalized:
-                            found.add(normalized)
-                            if len(found) >= max_listings:
-                                break
-            except Exception as e:
-                if debug:
-                    print(f"[debug] DOM scraping error: {e}")
-
-        # attempt 4: incremental scroll
-        if len(found) < max_listings:
-            try:
-                for _ in range(4):
-                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    await page.wait_for_timeout(1200 + random.randint(0, 1000))
-                    listing_selector = 'a[href*="/homedetails/"], a[data-testid*="property-card-link"], a[class*="property-card"]'
-                    links = await page.query_selector_all(listing_selector)
-                    for link in links:
-                        try:
-                            href = await link.get_attribute("href")
-                        except Exception:
-                            href = None
-                        if href:
-                            normalized = _normalize_url(href)
-                            if "zillow.com/homedetails/" in normalized:
-                                found.add(normalized)
-                                if len(found) >= max_listings:
-                                    break
-                    if len(found) >= max_listings:
-                        break
-            except Exception:
-                pass
-
-        results = list(found)[:max_listings]
-        if debug:
-            print(f"[debug] collect_listing_urls_from_search found {len(results)} urls (limit {max_listings})")
-        return results
-    finally:
-        try:
-            await page.close()
-        except Exception:
-            pass
-
-# -------------------------
-# Extract data from listing
-# -------------------------
-
-async def _extract_listing_data(page: Page, url: str, debug: bool = False) -> Dict:
-    name = None
-    city = None
-    brokerage = None
-    email = None
-    last_sale = None
-
-    try:
-        page_content = await page.content()
-        json_ld_data = extract_json_ld(page_content)
-        if debug:
-            print(f"[debug] Found {len(json_ld_data)} JSON-LD objects on listing")
-
-        for data in json_ld_data:
-            try:
-                t = data.get("@type") if isinstance(data, dict) else None
-                if t == "RealEstateAgent":
-                    name = name or data.get("name")
-                    email = email or data.get("email")
-                    if "affiliation" in data and isinstance(data["affiliation"], dict):
-                        brokerage = brokerage or data["affiliation"].get("name")
-                if t == "Offer" and "price" in data:
-                    last_sale = f"Price: {data.get('price')} {data.get('priceCurrency','')}"
-                if isinstance(data, dict) and "address" in data and isinstance(data["address"], dict):
-                    city = city or data["address"].get("addressLocality")
-            except Exception:
-                continue
-
-        # fallback DOM selectors
-        if not name:
-            for sel in ["a.ds-agent-name", ".ds-listing-agent-name", '[data-testid=\"listing-agent-name\"]', ".listing-agent-name"]:
-                try:
-                    el = await page.query_selector(sel)
-                    if el:
-                        text = (await el.inner_text()).strip()
-                        if text:
-                            name = text
-                            break
-                except Exception:
-                    continue
-
-        if not city:
-            for sel in ["h1", ".ds-address-container", "h1.ds-address-container", ".zsg-content-header"]:
-                try:
-                    el = await page.query_selector(sel)
-                    if el:
-                        text = (await el.inner_text()).strip()
-                        if text:
-                            city = text
-                            break
-                except Exception:
-                    continue
-
-        if not brokerage:
-            for sel in [".ds-listing-agent-company", ".agent-company", '[data-testid=\"brokerage-name\"]', ".listing-agent-company"]:
-                try:
-                    el = await page.query_selector(sel)
-                    if el:
-                        text = (await el.inner_text()).strip()
-                        if text:
-                            brokerage = text
-                            break
-                except Exception:
-                    continue
-
-        if not last_sale:
-            sold_keywords = ["Last sold", "Sold for", "Last sold for", "Sold on"]
-            lower_content = page_content.lower()
-            for kw in sold_keywords:
-                if kw.lower() in lower_content:
-                    idx = lower_content.find(kw.lower())
-                    snippet = page_content[max(0, idx - 120): idx + 200]
-                    last_sale = " ".join(snippet.split())[:400]
-                    break
-
-        try:
-            mail_el = await page.query_selector('a[href^="mailto:"]')
-            if mail_el:
-                href = (await mail_el.get_attribute("href")) or ""
-                if href.startswith("mailto:"):
-                    email = href.split("mailto:")[1].split("?")[0]
-        except Exception:
-            pass
-
-        if not email:
-            try:
-                anchors = await page.query_selector_all("a")
-                agent_link = None
-                for a in anchors:
-                    try:
-                        href = await a.get_attribute("href")
-                        txt = (await a.inner_text()) or ""
-                    except Exception:
-                        href = None
-                        txt = ""
-                    if not href:
-                        continue
-                    hl = href.lower()
-                    if ("zillow.com/profile" in hl) or ("/agent/" in hl) or ("/profile/" in hl) or ("/agents/" in hl):
-                        agent_link = href
-                        break
-                    if "agent" in txt.lower() and href.startswith("/"):
-                        agent_link = href
-                        break
-
-                if agent_link:
-                    agent_link = _normalize_url(agent_link)
-                    if debug:
-                        print("[debug] following agent link:", agent_link)
-                    context = page.context
-                    agent_page = await context.new_page()
-                    try:
-                        await agent_page.goto(agent_link, wait_until="domcontentloaded", timeout=15000)
-                        await agent_page.wait_for_timeout(700)
-                        content = await agent_page.content()
-                        jld = extract_json_ld(content)
-                        for d in jld:
-                            if isinstance(d, dict) and d.get("@type") == "RealEstateAgent":
-                                email = email or d.get("email")
-                                if not brokerage and "affiliation" in d and isinstance(d["affiliation"], dict):
-                                    brokerage = brokerage or d["affiliation"].get("name")
-                        if not email:
-                            mail_el = await agent_page.query_selector('a[href^="mailto:"]')
-                            if mail_el:
-                                href = (await mail_el.get_attribute("href")) or ""
-                                if href.startswith("mailto:"):
-                                    email = href.split("mailto:")[1].split("?")[0]
-                            elif "@" in content:
-                                m = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", content)
-                                if m:
-                                    email = m.group(0)
-                    except Exception:
-                        if debug:
-                            print("[debug] agent profile follow error (ignored)")
-                    finally:
-                        try:
-                            await agent_page.close()
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-
+        resp = requests.get(search_url, headers=get_headers(), timeout=REQUEST_TIMEOUT)
     except Exception as e:
         if debug:
-            print("[debug] extraction exception:", e)
+            print("[realtor] request error:", e)
+        return []
 
-    return {
-        "name": name,
-        "city": city,
-        "email": email,
-        "brokerage": brokerage,
-        "last_sale": last_sale,
-        "source": "zillow",
-        "url": url,
-    }
+    if resp.status_code != 200:
+        if debug:
+            print(f"[realtor] non-200 response: {resp.status_code}")
+        return []
 
-# -------------------------
-# Main runner
-# -------------------------
+    html = resp.text
 
-async def run_scrape(
+    # simple CAPTCHA/blocked detection
+    lower = html.lower()
+    if "captcha" in lower or "verify you are human" in lower or "bot" in lower:
+        if debug:
+            print("[realtor] CAPTCHA / anti-bot content detected in search page.")
+        return []
+
+    found = []
+    # 1) JSON-LD
+    for obj in extract_json_ld(html):
+        # Many pages include ItemList or arrays describing search results; try several shapes.
+        if isinstance(obj, dict):
+            t = obj.get("@type")
+            if t in ("ItemList",):
+                items = obj.get("itemListElement") or []
+                for it in items:
+                    # item can be a dict with 'url' or 'item' containing 'url'
+                    if isinstance(it, dict):
+                        url = it.get("url") or (it.get("item") or {}).get("url")
+                        if url and "/realestateandhomes-detail/" in url:
+                            url = urljoin(search_url, url)
+                            if url not in found:
+                                found.append(url)
+                                if len(found) >= limit:
+                                    return found
+            # Sometimes there's a direct url field for listings
+            if obj.get("url") and "/realestateandhomes-detail/" in obj.get("url"):
+                url = urljoin(search_url, obj.get("url"))
+                if url not in found:
+                    found.append(url)
+                    if len(found) >= limit:
+                        return found
+
+    # 2) Anchor scanning fallback
+    soup = BeautifulSoup(html, "html.parser")
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        # known Realtor listing segment
+        if "/realestateandhomes-detail/" in href:
+            full = urljoin(search_url, href)
+            if full not in found:
+                found.append(full)
+                if len(found) >= limit:
+                    break
+
+    # 3) A last attempt: look for data attributes or links containing '/home-details/' variants
+    if not found:
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            if "detail" in href and ("realestateandhomes-detail" in href or "/home-details/" in href):
+                full = urljoin(search_url, href)
+                if full not in found:
+                    found.append(full)
+                    if len(found) >= limit:
+                        break
+
+    if debug:
+        print(f"[realtor] found {len(found)} listing urls (limit {limit})")
+    return found[:limit]
+
+
+# --- listing extraction --------------------------------------------------
+
+def extract_listing_data(listing_url: str, debug: bool = False) -> Optional[Dict]:
+    """
+    Fetch a listing page and parse JSON-LD (preferred), falling back to a few DOM selectors.
+    Returns a dict with common fields (url, address, city, price, agent_name, agent_phone, agent_email, brokerage).
+    """
+    if debug:
+        print("[realtor] fetching listing:", listing_url)
+    try:
+        resp = requests.get(listing_url, headers=get_headers(), timeout=REQUEST_TIMEOUT)
+    except Exception as e:
+        if debug:
+            print("[realtor] listing request error:", e)
+        return None
+
+    if resp.status_code != 200:
+        if debug:
+            print("[realtor] non-200 listing response:", resp.status_code)
+        return None
+
+    html = resp.text
+    lower = html.lower()
+    if "captcha" in lower or "verify you are human" in lower:
+        if debug:
+            print("[realtor] CAPTCHA / anti-bot content detected on listing page.")
+        return None
+
+    result = {"url": listing_url, "source": "realtor"}
+
+    # JSON-LD parsing
+    json_objs = extract_json_ld(html)
+    for obj in json_objs:
+        if isinstance(obj, dict):
+            t = obj.get("@type")
+            if t in ("SingleFamilyResidence","House","Apartment","Residence","Product","Offer"):
+                # address
+                addr = obj.get("address") or {}
+                if isinstance(addr, dict):
+                    result.setdefault("address", addr.get("streetAddress"))
+                    result.setdefault("city", addr.get("addressLocality"))
+                    result.setdefault("region", addr.get("addressRegion"))
+                    result.setdefault("postal_code", addr.get("postalCode"))
+                # price
+                if "offers" in obj and isinstance(obj["offers"], dict):
+                    price = obj["offers"].get("price")
+                    if price:
+                        result["price"] = price
+                elif "price" in obj:
+                    result["price"] = obj.get("price")
+            if t in ("RealEstateAgent",):
+                result.setdefault("agent_name", obj.get("name"))
+                result.setdefault("agent_telephone", obj.get("telephone"))
+                result.setdefault("agent_email", obj.get("email"))
+                # affiliation might contain brokerage
+                aff = obj.get("affiliation") or {}
+                if isinstance(aff, dict):
+                    result.setdefault("brokerage", aff.get("name"))
+            # sometimes there's an Offer object with price
+            if t == "Offer" and isinstance(obj.get("price"), (str, int, float)):
+                result.setdefault("price", obj.get("price"))
+
+    # DOM fallback: find common selectors (best-effort; site may change)
+    if "price" not in result or "address" not in result:
+        soup = BeautifulSoup(html, "html.parser")
+        # address/title patterns
+        if "address" not in result:
+            for sel in ["h1", ".address", ".ldp-address", ".listing-street-address"]:
+                el = soup.select_one(sel)
+                if el and el.get_text(strip=True):
+                    result["address"] = el.get_text(strip=True)
+                    break
+        # price patterns
+        if "price" not in result:
+            for sel in [".price", ".rui__k8o6b6-0", ".ldp-price"]:
+                el = soup.select_one(sel)
+                if el and el.get_text(strip=True):
+                    result["price"] = el.get_text(strip=True)
+                    break
+        # agent info fallback
+        if "agent_name" not in result:
+            el = soup.select_one(".listing-agent-name, .agent-name")
+            if el and el.get_text(strip=True):
+                result["agent_name"] = el.get_text(strip=True)
+        if "agent_telephone" not in result:
+            el = soup.select_one('a[href^="tel:"]')
+            if el and el.get("href"):
+                result["agent_telephone"] = el.get("href").split("tel:")[-1].split("?")[0]
+
+        # search for any visible email (rare)
+        if "agent_email" not in result:
+            text = soup.get_text(" ")
+            if "@" in text:
+                # simple regex
+                import re
+                m = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text)
+                if m:
+                    result["agent_email"] = m.group(0)
+
+    if debug:
+        short = {k: result.get(k) for k in ("address", "city", "price", "agent_name", "agent_email")}
+        print("[realtor] extracted:", short)
+
+    return result
+
+
+# --- public run function -------------------------------------------------
+
+def run_scrape(
     search_urls: Optional[List[str]] = None,
-    max_total: Optional[int] = None,
     max_per_search: Optional[int] = None,
+    max_total: Optional[int] = None,
     debug: bool = False,
-    **kwargs,
 ) -> List[Dict]:
-    if max_per_search is None:
-        for alt in ("max_per_seed", "per_seed", "max_results_per_search"):
-            if alt in kwargs and kwargs[alt] is not None:
-                max_per_search = int(kwargs[alt])
-                break
-    if max_total is None:
-        for alt in ("max_listings", "max_listings_total", "max_results"):
-            if alt in kwargs and kwargs[alt] is not None:
-                max_total = int(kwargs[alt])
-                break
-
-    search_urls = search_urls or os.getenv("ZILLOW_SEED_URLS", "")
-    if isinstance(search_urls, str):
-        if not search_urls:
-            seed_defaults = [
-                "https://www.zillow.com/homes/for_sale/San-Francisco-CA_rb/",
-                "https://www.zillow.com/homes/for_sale/Los-Angeles-CA_rb/",
-                "https://www.zillow.com/homes/for_sale/New-York-NY_rb/",
-            ]
-            search_urls = seed_defaults
+    """
+    Synchronous entrypoint for collecting realtor leads.
+    Returns list of leads (dictionaries).
+    """
+    # env defaults
+    if search_urls is None:
+        env = os.getenv("REALTOR_SEED_URLS", "").strip()
+        if env:
+            search_urls = [s.strip() for s in env.split(",") if s.strip()]
         else:
-            search_urls = [s.strip() for s in search_urls.split(",") if s.strip()]
+            # sensible defaults
+            search_urls = [
+                "https://www.realtor.com/realestateandhomes-search/San-Francisco_CA",
+                "https://www.realtor.com/realestateandhomes-search/Los-Angeles_CA",
+            ]
 
     max_per_search = int(max_per_search or os.getenv("MAX_LISTINGS_PER_SEARCH", "6"))
     max_total = int(max_total or os.getenv("MAX_LISTINGS_TOTAL", "12"))
 
-    proxy_server = os.getenv("PROXY")
-    slow_mo_env = int(os.getenv("SLOW_MO", "0"))
-    storage_state_path = os.getenv("STORAGE_STATE", "")
-    headless_env = os.getenv("HEADLESS", "true").lower() not in ("0", "false", "no")
+    all_urls: List[str] = []
+    for seed in search_urls:
+        urls = collect_listing_urls_from_search(seed, limit=max_per_search, debug=debug)
+        for u in urls:
+            if u not in all_urls:
+                all_urls.append(u)
+            if len(all_urls) >= max_total:
+                break
+        if len(all_urls) >= max_total:
+            break
 
-    if os.getenv("CI") or os.getenv("GITHUB_ACTIONS") or ("DISPLAY" not in os.environ and not headless_env):
-        if debug and not headless_env:
-            print("[debug] No DISPLAY or running in CI; forcing headless=True to avoid X server errors.")
-        headless_env = True
+    if debug:
+        print(f"[realtor] will scrape {len(all_urls)} listings total")
 
     leads: List[Dict] = []
-    async with async_playwright() as p:
-        launch_args = [
-            "--no-sandbox",
-            "--disable-blink-features=AutomationControlled",
-            "--disable-dev-shm-usage",
-            "--disable-setuid-sandbox",
-            "--disable-web-security",
-            "--disable-features=IsolateOrigins,site-per-process",
-            "--disable-site-isolation-trials",
-            "--disable-infobars",
-            "--mute-audio",
-        ]
-        if proxy_server:
-            launch_args.append(f"--proxy-server={proxy_server}")
+    for url in all_urls[:max_total]:
+        # polite pacing
+        time.sleep(1.0 + random.random() * 1.5)
+        data = extract_listing_data(url, debug=debug)
+        if data:
+            leads.append(data)
 
-        try:
-            browser = await p.chromium.launch(
-                headless=headless_env,
-                slow_mo=slow_mo_env if slow_mo_env > 0 else None,
-                args=launch_args,
-            )
-        except Exception as e:
-            print("[error] Browser launch failed:", e)
-            raise
-
-        context_kwargs = dict(
-            user_agent=get_random_user_agent(),
-            viewport={"width": 1366, "height": 768},
-            locale="en-US",
-            timezone_id="America/Los_Angeles",
-            bypass_csp=True,
-        )
-        if storage_state_path and os.path.exists(storage_state_path):
-            context_kwargs["storage_state"] = storage_state_path
-        elif storage_state_path and debug:
-            print(f"[debug] STORAGE_STATE path provided but file not found: {storage_state_path}")
-
-        context = await browser.new_context(**context_kwargs)
-
-        try:
-            collected_urls: List[str] = []
-            for seed in search_urls:
-                if len(collected_urls) >= max_total:
-                    break
-                try:
-                    urls = await collect_listing_urls_from_search(context, seed, max_per_search, debug=debug)
-                except Exception as e:
-                    if debug:
-                        print("[debug] collect_listing_urls_from_search error:", e)
-                    urls = []
-                for u in urls:
-                    if len(collected_urls) >= max_total:
-                        break
-                    if u not in collected_urls:
-                        collected_urls.append(u)
-
-            if debug:
-                print(f"[debug] will scrape {len(collected_urls)} listings: {collected_urls}")
-
-            for url in collected_urls:
-                if len(leads) >= max_total:
-                    break
-                try:
-                    page = await context.new_page()
-                    await _apply_stealth_on_new_doc(page)
-                    await _set_page_headers_and_viewport(page, debug=debug)
-                    try:
-                        await page.goto(url, wait_until="networkidle", timeout=20000)
-                    except Exception:
-                        try:
-                            await page.goto(url, wait_until="domcontentloaded", timeout=20000)
-                        except Exception:
-                            if debug:
-                                print(f"[debug] failed to open listing {url}")
-                            await page.close()
-                            continue
-
-                    ok = await bypass_captcha(page, debug=debug)
-                    if not ok:
-                        if debug:
-                            print("[debug] Skipping listing due to captcha/interstitial.")
-                        await page.close()
-                        continue
-
-                    lead = await _extract_listing_data(page, url, debug=debug)
-                    if lead:
-                        leads.append(lead)
-                        if debug:
-                            print("[debug] scraped lead:", {k: v for k, v in lead.items() if k in ("name", "email", "city")})
-                    await page.close()
-                    await asyncio.sleep(0.8 + random.random() * 0.6)
-                except Exception as e:
-                    if debug:
-                        print("[debug] per-listing error:", e)
-                    continue
-        finally:
-            try:
-                await context.close()
-            except Exception:
-                pass
-            try:
-                await browser.close()
-            except Exception:
-                pass
+    if debug:
+        print(f"[realtor] scraped {len(leads)} leads")
 
     return leads
+
+
+# If run as script, fetch and attempt to save via models.save_leads() if available
+if __name__ == "__main__":
+    import sys
+
+    DEBUG = bool(os.getenv("DEBUG", "False").lower() in ("1", "true", "yes"))
+    leads = run_scrape(debug=DEBUG)
+    print("Leads:", leads)
+    # Try to save via your models if present
+    try:
+        import models  # type: ignore
+        if hasattr(models, "save_leads"):
+            print("Saving leads via models.save_leads...")
+            res = models.save_leads(leads)
+            print("Save result:", res)
+        else:
+            print("models.save_leads not found; skipping save.")
+    except Exception as e:
+        print("Could not import models.save_leads:", e)
+        sys.exit(0)
