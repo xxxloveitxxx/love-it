@@ -43,7 +43,8 @@ async def main():
 
     print(f"Scraped {len(leads)} leads")
     if len(leads) > 0:
-        print(json.dumps(leads, indent=2)[:2000])  # truncated output preview
+        print("Sample lead:")
+        print(json.dumps(leads[0], indent=2))
 
     # try to save via models if available
     if models is not None:
