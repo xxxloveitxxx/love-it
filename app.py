@@ -1,22 +1,14 @@
-import os
-from flask import Flask, render_template, jsonify, request
-from models import save_leads, get_all_leads
-from scraper import scrape_zillow_agents
+from flask import Flask, render_template
+from models import insert_lead, get_all_leads
 
 app = Flask(__name__)
 
-@app.get("/")
-def index():
-    rows = get_all_leads(limit=200)
-    return render_template("leads.html", leads=rows)
+@app.route("/leads")
+def leads_page():
+    leads = get_all_leads(100)
+    return render_template("leads.html", leads=leads)
 
-@app.post("/scrape")
-def scrape():
-    city = request.args.get("city", "new-york-ny")
-    limit = int(request.args.get("limit", "10"))
-    leads = scrape_zillow_agents(city=city, limit=limit)
-    inserted = save_leads(leads)
-    return jsonify({"ok": True, "attempted": len(leads), "inserted": inserted})
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
+@app.route("/test-insert")
+def test_insert():
+    insert_lead("John Doe", "Los Angeles", "Dream Realty", "Sold 12 homes in last 12 months", "https://zillow.com/agent-link")
+    return "✅ Test lead inserted!"
