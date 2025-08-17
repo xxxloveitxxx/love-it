@@ -1,25 +1,19 @@
 # scraper/realtor_scraper.py
 """
-Lightweight Realtor.com scraper.
-- Uses requests + BeautifulSoup (no Playwright).
-- Extracts listing URLs from a search page and parses JSON-LD (preferred).
-- Polite: randomized User-Agent + delays.
-- Does NOT attempt to bypass CAPTCHAs or anti-bot measures.
+Lightweight Realtor.com scraper with rate limiting handling.
 """
-
 from typing import List, Dict, Optional
 import os
 import time
 import random
 import json
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 
 # --- config / helpers ----------------------------------------------------
 
 DEFAULT_USER_AGENTS = [
-    # modern browser user agents
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -31,13 +25,39 @@ HEADERS_BASE = {
 }
 
 REQUEST_TIMEOUT = 15.0
-
+MAX_RETRIES = 3
+INITIAL_DELAY = 5.0
 
 def get_headers():
     h = HEADERS_BASE.copy()
     h["User-Agent"] = random.choice(DEFAULT_USER_AGENTS)
     return h
 
+def make_request(url: str, debug: bool = False) -> Optional[requests.Response]:
+    """Make request with retries and exponential backoff."""
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = requests.get(
+                url,
+                headers=get_headers(),
+                timeout=REQUEST_TIMEOUT
+            )
+            
+            if resp.status_code == 429:
+                wait_time = INITIAL_DELAY * (2 ** attempt)
+                if debug:
+                    print(f"[realtor] rate limited, waiting {wait_time}s (attempt {attempt + 1})")
+                time.sleep(wait_time)
+                continue
+                
+            return resp
+            
+        except Exception as e:
+            if debug:
+                print(f"[realtor] request error (attempt {attempt + 1}):", e)
+            time.sleep(INITIAL_DELAY * (2 ** attempt))
+    
+    return None
 
 def extract_json_ld(html: str) -> List[Dict]:
     """Return JSON-LD objects found on the page (best-effort)."""
@@ -83,17 +103,15 @@ def collect_listing_urls_from_search(
     debug: bool = False,
 ) -> List[str]:
     """
-    Extract listing detail URLs from a Realtor search page.
-    - Prefer JSON-LD sources.
-    - Fallback to anchor href scanning for known path segments.
+    Extract listing detail URLs from a Realtor search page with rate limit handling.
     """
     if debug:
         print("[realtor] fetching search page:", search_url)
-    try:
-        resp = requests.get(search_url, headers=get_headers(), timeout=REQUEST_TIMEOUT)
-    except Exception as e:
+    
+    resp = make_request(search_url, debug)
+    if not resp:
         if debug:
-            print("[realtor] request error:", e)
+            print("[realtor] failed after retries")
         return []
 
     if resp.status_code != 200:
