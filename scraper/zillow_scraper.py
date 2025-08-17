@@ -18,7 +18,6 @@ from playwright.async_api import (
 # helpers
 # -------------------------
 def _normalize_url(href: str) -> str:
-    """Turn a relative/protocol-relative href into an absolute zillow url."""
     if not href:
         return href
     href = href.strip()
@@ -32,9 +31,7 @@ def _normalize_url(href: str) -> str:
 
 
 async def _set_anti_bot_headers(page: Page):
-    # small, best-effort anti-bot headers + properties
     await page.set_extra_http_headers({"accept-language": "en-US,en;q=0.9"})
-    # try to nudge navigator.webdriver away (best-effort)
     try:
         await page.evaluate(
             """() => {
@@ -47,18 +44,12 @@ async def _set_anti_bot_headers(page: Page):
         pass
 
 
-# -------------------------
-# collect listing URLs from a search page
-# -------------------------
 async def collect_listing_urls_from_search(
     context: BrowserContext,
     seed_url: str,
     max_listings: int = 20,
     debug: bool = False,
 ) -> List[str]:
-    """
-    Visit a Zillow search/region page and return up to max_listings matching listing URLs.
-    """
     page = await context.new_page()
     try:
         await _set_anti_bot_headers(page)
@@ -96,10 +87,8 @@ async def collect_listing_urls_from_search(
                 low = href.lower()
                 if "zillow.com" in low and ("/homedetails/" in low or "zpid" in low):
                     href_n = href.split("?")[0].rstrip("/")
-                    # normalize (strip tracking params)
                     found.add(href_n)
 
-            # scroll a bit to trigger client-side loading
             try:
                 await page.evaluate("window.scrollBy(0, window.innerHeight);")
             except Exception:
@@ -108,7 +97,6 @@ async def collect_listing_urls_from_search(
             await page.wait_for_timeout(600 + random.randint(0, 800))
 
             if len(found) == last_count:
-                # give an extra short wait and break
                 await page.wait_for_timeout(500)
                 break
             last_count = len(found)
@@ -124,13 +112,7 @@ async def collect_listing_urls_from_search(
             pass
 
 
-# -------------------------
-# extract listing details (best-effort)
-# -------------------------
 async def _extract_listing_data(page: Page, url: str, debug: bool = False) -> Dict:
-    """
-    Extracts name/city/email/brokerage/last_sale from a listing page (best-effort).
-    """
     name = None
     city = None
     brokerage = None
@@ -139,7 +121,6 @@ async def _extract_listing_data(page: Page, url: str, debug: bool = False) -> Di
 
     try:
         await page.wait_for_timeout(500)
-        # try address/title selectors
         for sel in ["h1", ".ds-address-container", "h1.ds-address-container", ".zsg-content-header"]:
             try:
                 el = await page.query_selector(sel)
@@ -153,7 +134,6 @@ async def _extract_listing_data(page: Page, url: str, debug: bool = False) -> Di
             except Exception:
                 continue
 
-        # try agent name on listing page
         for sel in ["a.ds-agent-name", ".ds-listing-agent-name", '[data-testid="listing-agent-name"]', ".listing-agent-name"]:
             try:
                 el = await page.query_selector(sel)
@@ -167,7 +147,6 @@ async def _extract_listing_data(page: Page, url: str, debug: bool = False) -> Di
             except Exception:
                 continue
 
-        # try brokerage on listing page
         for sel in [".ds-listing-agent-company", ".agent-company", '[data-testid="brokerage-name"]', ".listing-agent-company"]:
             try:
                 el = await page.query_selector(sel)
@@ -181,7 +160,6 @@ async def _extract_listing_data(page: Page, url: str, debug: bool = False) -> Di
             except Exception:
                 continue
 
-        # detect last sale by scanning page content
         sold_keywords = ["Last sold", "Sold for", "Last sold for", "Sold on"]
         page_text = await page.content()
         for kw in sold_keywords:
@@ -203,7 +181,6 @@ async def _extract_listing_data(page: Page, url: str, debug: bool = False) -> Di
                 except Exception:
                     continue
 
-        # if listing page contains a mailto link, capture it
         mail_el = await page.query_selector('a[href^="mailto:"]')
         if mail_el:
             try:
@@ -215,7 +192,6 @@ async def _extract_listing_data(page: Page, url: str, debug: bool = False) -> Di
             except Exception:
                 pass
 
-        # follow agent profile if present for more info
         if not email:
             agent_link = None
             anchors = await page.query_selector_all("a")
@@ -247,7 +223,6 @@ async def _extract_listing_data(page: Page, url: str, debug: bool = False) -> Di
                         await agent_page.wait_for_timeout(800)
                         content = await agent_page.content()
 
-                        # mailto on agent profile
                         mail_el = await agent_page.query_selector('a[href^="mailto:"]')
                         if mail_el:
                             try:
@@ -259,7 +234,6 @@ async def _extract_listing_data(page: Page, url: str, debug: bool = False) -> Di
                             except Exception:
                                 pass
 
-                        # try plain-text email via regex
                         if not email and "@" in content:
                             m = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", content)
                             if m:
@@ -267,8 +241,7 @@ async def _extract_listing_data(page: Page, url: str, debug: bool = False) -> Di
                                 if debug:
                                     print(f"[debug] agent profile possible email: {email}")
 
-                        # try to extract brokerage/company on agent page
-                        for sel in [".brokerage", ".company", ".agent-company", ".agent-brokerage", ".agent-company-name"]:
+                        for sel in [".brokerage", ".company", ".agent-company", ".agent-brokerage", '.agent-company-name']:
                             try:
                                 el = await agent_page.query_selector(sel)
                                 if el:
@@ -281,7 +254,6 @@ async def _extract_listing_data(page: Page, url: str, debug: bool = False) -> Di
                             except Exception:
                                 continue
 
-                        # try agent name on agent profile if missing
                         if not name:
                             for sel in ["h1", ".agent-name", ".profile-name", "h1.agent-title"]:
                                 try:
@@ -305,7 +277,6 @@ async def _extract_listing_data(page: Page, url: str, debug: bool = False) -> Di
                     if debug:
                         print("[debug] agent profile follow error:", e)
 
-        # fallback: scan listing content for obvious emails
         if not email:
             page_text = await page.content()
             if "@" in page_text:
@@ -330,23 +301,36 @@ async def _extract_listing_data(page: Page, url: str, debug: bool = False) -> Di
     }
 
 
-# -------------------------
-# main run function
-# -------------------------
 async def run_scrape(
     search_urls: Optional[List[str]] = None,
     max_total: Optional[int] = None,
     max_per_search: Optional[int] = None,
     debug: bool = False,
+    **kwargs,
 ) -> List[Dict]:
     """
-    Entry point used by your runner. Returns a list of lead dicts.
+    Robust entrypoint. Accepts multiple alias names via kwargs:
+      - max_per_search OR max_per_seed
+      - max_total OR max_listings OR max_listings_total
+    Returns list of leads (dict).
     """
-    # load defaults from env if not provided
+    # accept alias names
+    if max_per_search is None:
+        for alt in ("max_per_seed", "max_per_search", "per_seed", "max_results_per_search"):
+            if alt in kwargs and kwargs[alt] is not None:
+                max_per_search = int(kwargs[alt])
+                break
+
+    if max_total is None:
+        for alt in ("max_listings", "max_listings_total", "max_total", "max_results"):
+            if alt in kwargs and kwargs[alt] is not None:
+                max_total = int(kwargs[alt])
+                break
+
+    # env defaults / normalization
     search_urls = search_urls or os.getenv("ZILLOW_SEED_URLS", "")
     if isinstance(search_urls, str):
         if not search_urls:
-            # default example city searches
             seed_defaults = [
                 "https://www.zillow.com/homes/for_sale/San-Francisco-CA_rb/",
                 "https://www.zillow.com/homes/for_sale/Los-Angeles-CA_rb/",
@@ -364,7 +348,6 @@ async def run_scrape(
         context = await browser.new_context()
 
         try:
-            # collect listing URLs
             collected_urls: List[str] = []
             for seed in search_urls:
                 if len(collected_urls) >= max_total:
@@ -384,7 +367,6 @@ async def run_scrape(
             if debug:
                 print(f"[debug] will scrape {len(collected_urls)} listings")
 
-            # visit each listing and extract details
             for i, url in enumerate(collected_urls):
                 if len(leads) >= max_total:
                     break
@@ -414,7 +396,6 @@ async def run_scrape(
                             print("[debug] scraped lead:", {k: v for k, v in lead.items() if k in ("name", "email", "city")})
                     await page.close()
 
-                    # small human-like pause
                     await asyncio.sleep(0.8 + random.random() * 0.6)
                 except Exception as e:
                     if debug:
