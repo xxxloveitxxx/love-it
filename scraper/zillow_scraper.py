@@ -204,3 +204,140 @@ async def _extract_listing_data(page, url: str, debug: bool=False) -> Dict:
         "source": "zillow",
         "url": url,
     }
+# scraper/zillow_scraper.py  (append this below your _extract_listing_data)
+
+from typing import List
+import random
+import asyncio
+from playwright.async_api import async_playwright
+
+DEFAULT_SEEDS = [
+    "https://www.zillow.com/homes/for_sale/San-Francisco-CA_rb/",
+    "https://www.zillow.com/homes/for_sale/Los-Angeles-CA_rb/",
+]
+
+async def _gather_listing_urls_from_search(page, search_url: str, max_links: int = 20, debug: bool=False) -> List[str]:
+    """Open a search page and return a deduped list of listing URLs (homedetails etc.)."""
+    try:
+        await page.goto(search_url, wait_until="networkidle", timeout=30000)
+    except Exception:
+        try:
+            await page.goto(search_url, wait_until="load", timeout=30000)
+        except Exception:
+            if debug: print("[debug] failed to open search url:", search_url)
+            return []
+
+    # small wait so dynamic content has time to load
+    await page.wait_for_timeout(1000 + random.randint(0, 1000))
+
+    anchors = await page.query_selector_all("a")
+    found = []
+    for a in anchors:
+        try:
+            href = await a.get_attribute("href")
+        except Exception:
+            href = None
+        if not href:
+            continue
+        href = href.split("#")[0]
+        lower = href.lower()
+        # Zillow listings commonly use /homedetails/ in the path; sometimes /b/ or /homedetails
+        if "/homedetails/" in lower or "/b/" in lower and "homedetails" not in lower:
+            url = _normalize_url(href)
+            if url not in found:
+                found.append(url)
+        # also include explicit /profile/ or /agent/ links? we only want listing pages here
+        if len(found) >= max_links:
+            break
+    if debug: print(f"[debug] found {len(found)} listing urls on {search_url}")
+    return found
+
+async def run_scrape(search_urls: List[str]=None, max_per_seed:int=6, max_listings:int=20, debug: bool=False) -> List[dict]:
+    """
+    Main entrypoint expected by scripts/run_scraper.py.
+    - search_urls: list of Zillow search pages to seed from. If None, uses DEFAULT_SEEDS.
+    - max_per_seed: how many listing pages to scrape per seed (keeps volume low).
+    - max_listings: global cap (safety).
+    """
+    if search_urls is None:
+        search_urls = DEFAULT_SEEDS
+
+    results = []
+    visited = set()
+    sem = asyncio.Semaphore(3)  # concurrency limit for scraping listing pages
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True, args=["--no-sandbox"])
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/120 Safari/537.36",
+            viewport={"width": 1280, "height": 800},
+        )
+
+        # single page to collect listing urls
+        base_page = await context.new_page()
+
+        try:
+            listing_candidates = []
+            for seed in search_urls:
+                try:
+                    urls = await _gather_listing_urls_from_search(base_page, seed, max_links=max_per_seed*3, debug=debug)
+                    # limit per seed
+                    listing_candidates.extend(urls[:max_per_seed])
+                except Exception as e:
+                    if debug: print("[debug] error gathering from seed", seed, ":", e)
+                # random pause between seeds to reduce fingerprint
+                await base_page.wait_for_timeout(800 + random.randint(0,800))
+
+            # dedupe & limit globally
+            deduped = []
+            for u in listing_candidates:
+                if u not in visited:
+                    visited.add(u)
+                    deduped.append(u)
+                if len(deduped) >= max_listings:
+                    break
+
+            if debug: print(f"[debug] will scrape {len(deduped)} listings")
+
+            async def _scrape_one(url):
+                async with sem:
+                    page = await context.new_page()
+                    try:
+                        await page.goto(url, wait_until="networkidle", timeout=25000)
+                    except Exception:
+                        try:
+                            await page.goto(url, wait_until="load", timeout=25000)
+                        except Exception as e:
+                            if debug: print("[debug] failed to open listing", url, e)
+                            await page.close()
+                            return None
+
+                    # small random delay to mimic human browsing
+                    await page.wait_for_timeout(600 + random.randint(0, 800))
+                    try:
+                        data = await _extract_listing_data(page, url, debug=debug)
+                    except Exception as e:
+                        if debug: print("[debug] extract failed for", url, e)
+                        data = None
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+                    return data
+
+            tasks = [asyncio.create_task(_scrape_one(u)) for u in deduped]
+            completed = await asyncio.gather(*tasks)
+            for item in completed:
+                if item:
+                    results.append(item)
+
+        finally:
+            try:
+                await base_page.close()
+            except Exception:
+                pass
+            await context.close()
+            await browser.close()
+
+    return results
