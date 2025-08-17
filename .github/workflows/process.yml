@@ -72,14 +72,17 @@ jobs:
 
 
       - name: Run scraper script
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-          DEBUG: "true"
-          MAX_LISTINGS_TOTAL: "2"
-          ZILLOW_SEED_URLS: "https://www.zillow.com/homes/for_sale/San-Francisco-CA_rb/"
-        run: |
-         PYTHONPATH=. python scripts/run_scraper.py
+  env:
+    SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+    SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+    DEBUG: "true"
+    MAX_LISTINGS_TOTAL: "10"
+    MAX_LISTINGS_PER_SEARCH: "8"
+    ZILLOW_SEED_URLS: "https://www.zillow.com/homes/for_sale/San-Francisco-CA_rb/,https://www.zillow.com/homes/for_sale/Los-Angeles-CA_rb/,https://www.zillow.com/homes/for_sale/New-York-NY_rb/"
+    PLAYWRIGHT_SLOW_MO: "500"  # Add delays between actions
+    PLAYWRIGHT_HEADLESS: "1"
+  run: |
+    PYTHONPATH=. python scripts/run_scraper.py
   
 
           # optional: override seeds / behavior via env
