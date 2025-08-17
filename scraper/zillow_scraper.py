@@ -1,46 +1,47 @@
 # scraper/zillow_scraper.py
 """
-Synchronous Zillow scraper using Playwright sync API.
+Async Zillow scraper using Playwright async API.
 
-Exports:
-    run_scrape(max_properties: int = 6) -> list[dict]
+Call:
+    leads = await run_scrape(search_urls=[...], max_properties=10, headless=True)
 
-Note: Zillow's markup changes frequently. This is a conservative, best-effort
-template. Update selectors to match Zillow's live DOM for better data.
+Returns:
+    list[dict] with keys: name, city, email, brokerage, last_sale, source, url
 """
 import os
-import time
+import asyncio
 from typing import List, Dict, Optional
 from urllib.parse import urljoin
 
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+from playwright.async_api import async_playwright, TimeoutError as PWTimeoutError
 
-DEFAULT_SEED = "https://www.zillow.com/homes/for_sale/"
+DEFAULT_SEEDS = [
+    "https://www.zillow.com/homes/for_sale/"
+]
 
-def _get_seed_urls() -> List[str]:
+def _get_seed_urls(provided: Optional[List[str]] = None) -> List[str]:
+    if provided:
+        return provided
     env = os.getenv("ZILLOW_SEED_URLS", "")
     if env:
         return [s.strip() for s in env.split(",") if s.strip()]
-    return [DEFAULT_SEED]
+    return DEFAULT_SEEDS
 
 def _normalize_url(href: Optional[str]) -> Optional[str]:
     if not href:
         return None
     href = href.strip()
-    # Zillow sometimes uses relative links
     if href.startswith("/"):
         return urljoin("https://www.zillow.com", href)
     return href
 
-def _collect_listing_links_from_search_page(page, max_links: int) -> List[str]:
-    """Return a list of listing URLs found on the search page (best-effort)."""
-    links = []
-    # Try a few heuristics for Zillow listing links
+async def _collect_listing_links_from_search_page(page, max_links: int) -> List[str]:
+    links: List[str] = []
     try:
-        # Common: /homedetails/... or links with "list-card-link" or "list-card"
-        anchors = page.query_selector_all("a[href*='/homedetails/'], a.list-card-link, a.zsg-photo-card-overlay-link")
+        # heuristics for common listing anchors
+        anchors = await page.query_selector_all("a[href*='/homedetails/'], a.list-card-link, a.zsg-photo-card-overlay-link")
         for a in anchors:
-            href = a.get_attribute("href")
+            href = await a.get_attribute("href")
             href = _normalize_url(href)
             if not href:
                 continue
@@ -51,12 +52,12 @@ def _collect_listing_links_from_search_page(page, max_links: int) -> List[str]:
     except Exception:
         pass
 
-    # Fallback: search for anchors with "zillow" and "homedetails"
+    # fallback scan
     if not links:
         try:
-            anchors = page.query_selector_all("a")
+            anchors = await page.query_selector_all("a")
             for a in anchors:
-                href = a.get_attribute("href")
+                href = await a.get_attribute("href")
                 if href and "/homedetails/" in href:
                     href = _normalize_url(href)
                     if href and href not in links:
@@ -68,9 +69,7 @@ def _collect_listing_links_from_search_page(page, max_links: int) -> List[str]:
 
     return links
 
-def _extract_listing_data(page, url: str) -> Dict:
-    """Best-effort extraction for a single property page. Keep fields lightweight."""
-    # Default values
+async def _extract_listing_data(page, url: str) -> Dict:
     name = None
     city = None
     brokerage = None
@@ -78,50 +77,54 @@ def _extract_listing_data(page, url: str) -> Dict:
     last_sale = None
 
     try:
-        # address/title -> usually in <h1> or a top header container
-        addr_el = page.query_selector("h1, .ds-address-container, .zsg-content-header, .ds-address")
+        addr_el = await page.query_selector("h1, .ds-address-container, .zsg-content-header, .ds-address")
         if addr_el:
-            city = addr_el.inner_text().strip()
+            city = (await addr_el.inner_text()).strip()
 
-        # Agent/Listing info - Zillow layout varies. Try multiple fallbacks.
-        # Try: agent name link
         agent_sel_variants = [
-            "a.ds-agent-name",        # some Zillow components
-            ".listing-agent-name",    # fallback
+            "a.ds-agent-name",
+            ".listing-agent-name",
             ".zsg-agent-name",
-            ".ds-listing-agent-title a"
+            ".ds-listing-agent-title a",
+            "text=Listing by"
         ]
         for sel in agent_sel_variants:
-            el = page.query_selector(sel)
-            if el:
-                text = el.inner_text().strip()
-                if text:
-                    name = text
-                    break
+            try:
+                el = await page.query_selector(sel)
+                if el:
+                    text = (await el.inner_text()).strip()
+                    if text:
+                        name = text
+                        break
+            except Exception:
+                continue
 
-        # Brokerage
         brokerage_sel_variants = [
             ".ds-listing-agent-company", ".zsg-agent-company", ".agent-company"
         ]
         for sel in brokerage_sel_variants:
-            el = page.query_selector(sel)
-            if el:
-                brokerage = el.inner_text().strip()
-                break
-
-        # Last sale / transaction history - often not available; try to find "Last sold" text
-        sold_el = page.query_selector("text=Last sold, .zsg-listing-attribute, .ds-home-fact-list")
-        if sold_el:
             try:
-                last_sale = sold_el.inner_text().strip()
+                el = await page.query_selector(sel)
+                if el:
+                    brokerage = (await el.inner_text()).strip()
+                    break
             except Exception:
-                last_sale = None
+                continue
 
-        # Zillow usually does not show agent emails publicly; leave None
+        # last sale / sold info - try searching for "Last sold" text nodes, best-effort
+        try:
+            sold_el = await page.query_selector("text=Last sold")
+            if sold_el:
+                # get parent or surrounding
+                parent = await sold_el.evaluate_handle("node => node.parentElement || node")
+                last_sale = (await (await parent.get_property("innerText")).json_value()).strip()
+        except Exception:
+            pass
+
+        # Zillow normally doesn't reveal emails publicly
         email = None
 
     except Exception:
-        # If anything breaks, return whatever we managed to find
         pass
 
     return {
@@ -134,73 +137,72 @@ def _extract_listing_data(page, url: str) -> Dict:
         "url": url,
     }
 
-def run_scrape(max_properties: int = 6, headless: bool = True) -> List[Dict]:
+async def run_scrape(
+    search_urls: Optional[List[str]] = None,
+    max_properties: int = 6,
+    headless: bool = True,
+) -> List[Dict]:
     """
-    Run a synchronous scrape and return a list of lead dicts.
+    Async run_scrape that your runner can await.
 
-    Parameters
-    ----------
-    max_properties : int
-        Maximum number of properties to scrape across seed pages (total).
-    headless : bool
-        If False, will run browsers visibly (useful for local debugging).
+    Args:
+        search_urls: optional list of search pages to start from. If None, uses env or defaults.
+        max_properties: total number of property pages to scrape across seeds.
+        headless: run headless browser if True.
+
+    Returns:
+        list of lead dicts.
     """
+    seeds = _get_seed_urls(search_urls)
     results: List[Dict] = []
-    seeds = _get_seed_urls()
-    per_seed_limit = max(1, max_properties)  # we'll cap overall later
+    per_seed_limit = max(1, max_properties)
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless, args=["--no-sandbox"])
-        context = browser.new_context()
-        page = context.new_page()
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=headless, args=["--no-sandbox"])
+        context = await browser.new_context()
+        page = await context.new_page()
 
         for seed in seeds:
             if len(results) >= max_properties:
                 break
             try:
-                page.goto(seed, timeout=30000)
+                await page.goto(seed, timeout=30000)
             except PWTimeoutError:
-                # skip if page load times out
                 continue
             except Exception:
                 continue
 
-            # Allow some JS to run — site is dynamic
-            time.sleep(2)
+            # let dynamic content render
+            await asyncio.sleep(2)
 
-            # collect candidate links from this search result page
-            links = _collect_listing_links_from_search_page(page, per_seed_limit)
-            # iterate links, visit each property
+            links = await _collect_listing_links_from_search_page(page, per_seed_limit)
             for link in links:
                 if len(results) >= max_properties:
                     break
                 try:
-                    page.goto(link, timeout=30000)
+                    await page.goto(link, timeout=30000)
                 except PWTimeoutError:
                     continue
                 except Exception:
                     continue
 
-                # let page render
-                time.sleep(2)
-                lead = _extract_listing_data(page, link)
+                await asyncio.sleep(2)
+                lead = await _extract_listing_data(page, link)
                 results.append(lead)
+                await asyncio.sleep(1.0)
 
-                # polite pause between visits
-                time.sleep(1.0)
-
-        # cleanup
         try:
-            context.close()
-            browser.close()
+            await context.close()
+            await browser.close()
         except Exception:
             pass
 
     return results
 
-# If run directly, print a short sample (helps debugging if someone runs this file)
+# quick debug when invoked directly
 if __name__ == "__main__":
-    import json
-    max_props = int(os.getenv("MAX_LISTINGS_TOTAL", "4"))
-    leads = run_scrape(max_properties=max_props, headless=True)
+    import asyncio, json
+    seeds_env = os.getenv("ZILLOW_SEED_URLS")
+    seeds = [s.strip() for s in seeds_env.split(",")] if seeds_env else None
+    leads = asyncio.run(run_scrape(search_urls=seeds, max_properties=4, headless=True))
     print(json.dumps(leads, indent=2))
