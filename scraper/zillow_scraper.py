@@ -206,7 +206,7 @@ async def _extract_listing_data(page, url: str, debug: bool=False) -> Dict:
     }
 # scraper/zillow_scraper.py  (append this below your _extract_listing_data)
 
-from typing import List
+from typing import Dict, List, Optional
 import random
 import asyncio
 from playwright.async_api import async_playwright
