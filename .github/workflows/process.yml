@@ -3,7 +3,7 @@ name: Scrape Realtor Leads (cron + manual)
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */3 * * *'  # every 3 hours (adjust)
+    - cron: '0 */3 * * *'  # every 3 hours; adjust as desired
 
 jobs:
   scrape:
@@ -24,22 +24,8 @@ jobs:
 
       - name: Run Realtor scraper
         env:
-          # pass your secrets so models.save_leads (or your scripts) can access Supabase
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-          # optional overrides:
-          # REALTOR_SEED_URLS: "https://www.realtor.com/realestateandhomes-search/San-Francisco_CA"
-          # MAX_LISTINGS_PER_SEARCH: "6"
-          # MAX_LISTINGS_TOTAL: "12"
           DEBUG: "true"
         run: |
-          # Ensure repo root is importable
-          PYTHONPATH=. python -c "from scraper.realtor_scraper import run_scrape; import os, json; leads = run_scrape(debug=os.getenv('DEBUG','')!=''); print('SCRAPED', len(leads)); \
-          import models as m; \
-          print('Attempting save via models.save_leads' if hasattr(m,'save_leads') else 'models.save_leads not found'); \
-          \
-          try:
-              if hasattr(m,'save_leads'):
-                  print('Saving...'); print(m.save_leads(leads))
-          except Exception as e:
-              print('Save error:', e)"
+          PYTHONPATH=. python scripts/run_realtor.py
