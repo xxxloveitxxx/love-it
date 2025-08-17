@@ -10,6 +10,21 @@ import time
 from playwright.async_api import async_playwright, TimeoutError as PWTimeoutError
 
 
+
+async def _set_anti_bot_headers(page: Page):
+    # realistic UA + headers to reduce bot fingerprinting
+    await page.set_extra_http_headers({
+        "accept-language": "en-US,en;q=0.9",
+    })
+    await page.evaluate(
+        """() => {
+            // override some navigator properties in-page (best-effort)
+            try {
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            } catch (e) {}
+        }"""
+    )
+
 async def _extract_listing_data(page, url: str, debug: bool=False) -> Dict:
     """Best-effort extraction of agent/name/city/brokerage/last_sale from a listing page.
        Also tries to follow an agent/profile link if present to extract email/brokerage.
