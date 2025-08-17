@@ -1,23 +1,42 @@
-# .github/workflows/scrape.yml
-name: Scraper
+name: Zillow Scraper Cron
 
 on:
   schedule:
-    - cron: "*/20 * * * *"  # every 20 min
+    - cron: "*/20 * * * *"
+  workflow_dispatch:
 
 jobs:
-  run-scraper:
+  scrape-and-export:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
+
       - name: Install deps
-        run: pip install -r requirements.txt
-      - name: Run scraper
-        run: python scraper.py
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps
+
+      - name: Run scraper (rotate cities)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          SUPABASE_EXPORT_BUCKET: exports
+          GSHEET_ID: ${{ secrets.GSHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          python - << 'PY'
+          import os, random
+          from scraper import scrape_zillow_agents
+          from models import save_leads
+          # Simple rotation to avoid hammering one page
+          cities = ["los-angeles-ca","new-york-ny","miami-fl","seattle-wa","austin-tx","phoenix-az","chicago-il","denver-co"]
+          city = random.choice(cities)
+          leads = scrape_zillow_agents(city=city, limit=8, delay=2.2)
+          print(f"Scraped {len(leads)} leads from {city}")
+          inserted = save_leads(leads)
+          print(f"Inserted {inserted} new leads")
+          PY
