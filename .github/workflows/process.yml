@@ -1,17 +1,15 @@
-name: Scrape Leads (cron + manual)
+name: Scrape Realtor Leads (cron + manual)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '*/20 * * * *'   # every 20 minutes
+    - cron: '0 */3 * * *'  # every 3 hours (adjust)
 
 jobs:
-  run-scraper:
+  scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Python 3.11
@@ -19,76 +17,29 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install apt packages required by Playwright
-        run: |
-          sudo apt-get update
-
-          # Try the canonical package list for Playwright on modern Ubuntu.
-          # Note: on Ubuntu 24.04 "libasound2" may be provided as "libasound2t64".
-          sudo apt-get install -y --no-install-recommends \
-            libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libxkbcommon0 \
-            libxcomposite1 libxcb1 libxrandr2 libxss1 libgbm1 \
-            libx11-xcb1 libxdamage1 libxinerama1 libxi6 libpangocairo-1.0-0 \
-            libpango-1.0-0 libgtk-3-0 || true
-
-          # Ensure sound library attempt: prefer libasound2t64 (Ubuntu 24.04)
-          if ! dpkg -s libasound2t64 >/dev/null 2>&1; then
-            echo "Attempting to install libasound2 (fallback)..."
-            sudo apt-get install -y --no-install-recommends libasound2 || true
-          else
-            sudo apt-get install -y --no-install-recommends libasound2t64 || true
-          fi
-
-          # verify installed packages (helpful for debugging)
-          echo "Installed packages (grep a few expected names):"
-          dpkg -l | egrep 'libnss3|libgtk-3-0|libgbm|libasound' || true
-
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: ${{ runner.os }}-pip-
-
-      - name: Install Python dependencies
-        env:
-          PIP_NO_CACHE_DIR: "off"
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          python -m playwright install --with-deps
+          pip install requests beautifulsoup4
 
-
-      - name: Install Playwright browsers + deps
-        # installs browser binaries and native deps used by Playwright
-        run: |
-          # prefer the python wrapper installer
-          python -m playwright install --with-deps
-
-      - name: Install Playwright & browsers (needed in CI)
-        run: |
-          python -m pip install --upgrade pip
-          pip install playwright==1.45.0
-          python -m playwright install --with-deps chromium
-
-
-      - name: Run scraper script
+      - name: Run Realtor scraper
         env:
+          # pass your secrets so models.save_leads (or your scripts) can access Supabase
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-          DEBUG: "true"
-          MAX_LISTINGS_TOTAL: "10"
-          MAX_LISTINGS_PER_SEARCH: "8"
-          ZILLOW_SEED_URLS: "https://www.zillow.com/homes/for_sale/San-Francisco-CA_rb/,https://www.zillow.com/homes/for_sale/Los-Angeles-CA_rb/,https://www.zillow.com/homes/for_sale/New-York-NY_rb/"
-          PLAYWRIGHT_SLOW_MO: "500"  # Add delays between actions
-          PLAYWRIGHT_HEADLESS: "1"
-        run: |
-         PYTHONPATH=. python scripts/run_scraper.py
-  
-
-          # optional: override seeds / behavior via env
-          # ZILLOW_SEED_URLS: "https://www.zillow.com/homes/for_sale/San-Francisco-CA_rb/,https://www.zillow.com/homes/for_sale/Chicago-IL_rb/"
+          # optional overrides:
+          # REALTOR_SEED_URLS: "https://www.realtor.com/realestateandhomes-search/San-Francisco_CA"
           # MAX_LISTINGS_PER_SEARCH: "6"
           # MAX_LISTINGS_TOTAL: "12"
-         
+          DEBUG: "true"
+        run: |
+          # Ensure repo root is importable
+          PYTHONPATH=. python -c "from scraper.realtor_scraper import run_scrape; import os, json; leads = run_scrape(debug=os.getenv('DEBUG','')!=''); print('SCRAPED', len(leads)); \
+          import models as m; \
+          print('Attempting save via models.save_leads' if hasattr(m,'save_leads') else 'models.save_leads not found'); \
+          \
+          try:
+              if hasattr(m,'save_leads'):
+                  print('Saving...'); print(m.save_leads(leads))
+          except Exception as e:
+              print('Save error:', e)"
