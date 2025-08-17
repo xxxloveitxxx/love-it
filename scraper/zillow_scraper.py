@@ -615,7 +615,8 @@ async def run_scrape(
     leads: List[Dict] = []
     async with async_playwright() as p:
         browser = await p.chromium.launch(
-            headless=True,
+    headless=False,      # show the browser locally
+    slow_mo=120,         # slow down actions so you can watch
             args=[
                 "--no-sandbox",
                 "--disable-blink-features=AutomationControlled",
