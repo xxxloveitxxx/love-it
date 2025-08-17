@@ -3,7 +3,7 @@ name: Scrape Realtor Leads (cron + manual)
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */3 * * *'  # every 3 hours; adjust as desired
+    - cron: '0 */6 * * *'  # reduced to every 6 hours
 
 jobs:
   scrape:
@@ -20,12 +20,15 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4
+          pip install requests beautifulsoup4 python-dotenv
 
       - name: Run Realtor scraper
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           DEBUG: "true"
+          # Add these to reduce request frequency
+          MAX_LISTINGS_PER_SEARCH: "3"
+          MAX_LISTINGS_TOTAL: "6"
         run: |
           PYTHONPATH=. python scripts/run_realtor.py
