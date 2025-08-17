@@ -62,9 +62,7 @@ def extract_json_ld(page_content: str) -> List[Dict]:
             data = json.loads(clean_match.strip())
             results.append(data)
         except json.JSONDecodeError:
-            # sometimes page includes multiple objects or trailing commas; try best-effort
             try:
-                # if it is an array-like text
                 data = json.loads("[" + clean_match.strip().rstrip(",") + "]")
                 results.extend(data)
             except Exception:
@@ -76,19 +74,20 @@ def extract_json_ld(page_content: str) -> List[Dict]:
 # -------------------------
 
 async def _apply_stealth_on_new_doc(page: Page):
-    # small anti-automation tweaks to navigator props
-    await page.evaluate_on_new_document(
-        """() => {
-            try {
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
-                Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
-            } catch(e) {}
-        }"""
-    )
+    # Use add_init_script (Playwright Python) to inject before any script runs
+    script = """
+    () => {
+        try {
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+            Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
+        } catch(e) {}
+    }
+    """
+    # add_init_script is the Python API equivalent of evaluate_on_new_document
+    await page.add_init_script(script)
 
 async def _set_page_headers_and_viewport(page: Page, debug: bool = False):
-    # Use random-ish UA and viewport to reduce automation fingerprint
     ua = get_random_user_agent()
     viewport = get_random_viewport()
     try:
@@ -107,7 +106,6 @@ async def _set_page_headers_and_viewport(page: Page, debug: bool = False):
         if debug:
             print("[debug] set_viewport_size failed")
 
-    # small random mouse movement
     try:
         await page.mouse.move(random.randint(50, viewport["width"] - 50), random.randint(50, viewport["height"] - 50))
     except Exception:
@@ -119,13 +117,11 @@ async def bypass_captcha(page: Page, debug: bool = False) -> bool:
     if "captcha" in content or "verify" in content or "are you a human" in content:
         if debug:
             print("[debug] CAPTCHA / anti-bot content detected in page content.")
-        # light attempts to get past ephemeral checks
         try:
             await page.reload(timeout=8000)
             await page.wait_for_timeout(1500)
         except Exception:
             pass
-        # if still captcha-like, give up for this seed
         content2 = (await page.content()).lower()
         if "captcha" in content2 or "verify" in content2:
             if debug:
@@ -152,13 +148,10 @@ async def collect_listing_urls_from_search(
             print(f"[debug] Opening search page: {seed_url}")
 
         try:
-            # go to seed
             await page.goto(seed_url, wait_until="domcontentloaded", timeout=30000)
-            # allow resources to settle
             try:
                 await page.wait_for_load_state("networkidle", timeout=20000)
             except Exception:
-                # some pages don't hit networkidle; ignore
                 pass
             await page.wait_for_timeout(random.randint(800, 1800))
         except Exception as e:
@@ -166,7 +159,6 @@ async def collect_listing_urls_from_search(
                 print(f"[debug] Navigation error: {e}")
             return []
 
-        # quick captcha check
         ok = await bypass_captcha(page, debug=debug)
         if not ok:
             return []
@@ -179,10 +171,8 @@ async def collect_listing_urls_from_search(
         if debug:
             print(f"[debug] Found {len(json_ld_data)} JSON-LD objects")
         for data in json_ld_data:
-            # some JSON-LD objects are nested; handle common shapes
             try:
                 if isinstance(data, dict) and data.get("@type") in ("ListItem", "Offer", "ItemList"):
-                    # ItemList may include itemListElement
                     if data.get("url"):
                         url = _normalize_url(data["url"])
                         if "zillow.com/homedetails/" in url or "homedetails" in url:
@@ -202,43 +192,39 @@ async def collect_listing_urls_from_search(
             except Exception:
                 continue
 
-        # attempt 2: window state (site uses a client state object sometimes)
+        # attempt 2: window state
         if not found:
             try:
                 state = await page.evaluate("() => (window.__initialState__ || window.appState || window.__REDUX_STATE__ || {})")
                 if state:
-                    # navigate common nested structures (best-effort)
-                    if isinstance(state, dict):
-                        # attempt to find URLs inside gdpClientCache or search results
-                        def scan_obj(o):
-                            urls = []
-                            if isinstance(o, dict):
-                                for k, v in o.items():
-                                    if isinstance(v, str) and ("zillow.com/homedetails" in v or "/homedetails/" in v):
-                                        urls.append(_normalize_url(v))
-                                    else:
-                                        urls.extend(scan_obj(v))
-                            elif isinstance(o, list):
-                                for item in o:
-                                    urls.extend(scan_obj(item))
-                            return urls
-                        found_urls = scan_obj(state)
-                        for u in found_urls:
-                            if "zillow.com/homedetails/" in u:
-                                found.add(u)
+                    def scan_obj(o):
+                        urls = []
+                        if isinstance(o, dict):
+                            for k, v in o.items():
+                                if isinstance(v, str) and ("zillow.com/homedetails" in v or "/homedetails/" in v):
+                                    urls.append(_normalize_url(v))
+                                else:
+                                    urls.extend(scan_obj(v))
+                        elif isinstance(o, list):
+                            for item in o:
+                                urls.extend(scan_obj(item))
+                        return urls
+                    found_urls = scan_obj(state)
+                    for u in found_urls:
+                        if "zillow.com/homedetails/" in u:
+                            found.add(u)
                 if debug:
                     print(f"[debug] Found {len(found)} URLs from state")
             except Exception:
                 if debug:
                     print("[debug] State extraction error (ignored)")
 
-        # attempt 3: DOM scraping fallback
+        # attempt 3: DOM fallback
         if not found:
             if debug:
                 print("[debug] Using DOM fallback for URLs")
             try:
                 listing_selector = 'a[href*="/homedetails/"], a[data-testid*="property-card-link"], a[class*="property-card"]'
-                # initial small scrolls to trigger lazy load
                 await page.evaluate("window.scrollTo(0, 600)")
                 await page.wait_for_timeout(700)
                 links = await page.query_selector_all(listing_selector)
@@ -257,7 +243,7 @@ async def collect_listing_urls_from_search(
                 if debug:
                     print(f"[debug] DOM scraping error: {e}")
 
-        # attempt 4: incremental scroll to find more
+        # attempt 4: incremental scroll
         if len(found) < max_listings:
             try:
                 for _ in range(4):
@@ -292,7 +278,7 @@ async def collect_listing_urls_from_search(
             pass
 
 # -------------------------
-# Extract data from individual listing page
+# Extract data from listing
 # -------------------------
 
 async def _extract_listing_data(page: Page, url: str, debug: bool = False) -> Dict:
@@ -325,7 +311,7 @@ async def _extract_listing_data(page: Page, url: str, debug: bool = False) -> Di
 
         # fallback DOM selectors
         if not name:
-            for sel in ["a.ds-agent-name", ".ds-listing-agent-name", '[data-testid="listing-agent-name"]', ".listing-agent-name"]:
+            for sel in ["a.ds-agent-name", ".ds-listing-agent-name", '[data-testid=\"listing-agent-name\"]', ".listing-agent-name"]:
                 try:
                     el = await page.query_selector(sel)
                     if el:
@@ -349,7 +335,7 @@ async def _extract_listing_data(page: Page, url: str, debug: bool = False) -> Di
                     continue
 
         if not brokerage:
-            for sel in [".ds-listing-agent-company", ".agent-company", '[data-testid="brokerage-name"]', ".listing-agent-company"]:
+            for sel in [".ds-listing-agent-company", ".agent-company", '[data-testid=\"brokerage-name\"]', ".listing-agent-company"]:
                 try:
                     el = await page.query_selector(sel)
                     if el:
@@ -360,7 +346,6 @@ async def _extract_listing_data(page: Page, url: str, debug: bool = False) -> Di
                 except Exception:
                     continue
 
-        # last sale detection via in-page text
         if not last_sale:
             sold_keywords = ["Last sold", "Sold for", "Last sold for", "Sold on"]
             lower_content = page_content.lower()
@@ -371,7 +356,6 @@ async def _extract_listing_data(page: Page, url: str, debug: bool = False) -> Di
                     last_sale = " ".join(snippet.split())[:400]
                     break
 
-        # email extraction: mailto first
         try:
             mail_el = await page.query_selector('a[href^="mailto:"]')
             if mail_el:
@@ -381,7 +365,6 @@ async def _extract_listing_data(page: Page, url: str, debug: bool = False) -> Di
         except Exception:
             pass
 
-        # follow agent profile if no email
         if not email:
             try:
                 anchors = await page.query_selector_all("a")
@@ -413,7 +396,6 @@ async def _extract_listing_data(page: Page, url: str, debug: bool = False) -> Di
                         await agent_page.goto(agent_link, wait_until="domcontentloaded", timeout=15000)
                         await agent_page.wait_for_timeout(700)
                         content = await agent_page.content()
-                        # json-ld
                         jld = extract_json_ld(content)
                         for d in jld:
                             if isinstance(d, dict) and d.get("@type") == "RealEstateAgent":
@@ -466,11 +448,6 @@ async def run_scrape(
     debug: bool = False,
     **kwargs,
 ) -> List[Dict]:
-    """
-    Entrypoint that returns a list of leads.
-    Accepts many alias names via kwargs for backwards compatibility.
-    """
-    # alias handling
     if max_per_search is None:
         for alt in ("max_per_seed", "per_seed", "max_results_per_search"):
             if alt in kwargs and kwargs[alt] is not None:
@@ -482,7 +459,6 @@ async def run_scrape(
                 max_total = int(kwargs[alt])
                 break
 
-    # env defaults
     search_urls = search_urls or os.getenv("ZILLOW_SEED_URLS", "")
     if isinstance(search_urls, str):
         if not search_urls:
@@ -498,23 +474,18 @@ async def run_scrape(
     max_per_search = int(max_per_search or os.getenv("MAX_LISTINGS_PER_SEARCH", "6"))
     max_total = int(max_total or os.getenv("MAX_LISTINGS_TOTAL", "12"))
 
-    # runtime options via env
-    proxy_server = os.getenv("PROXY")  # e.g. http://user:pass@host:port
+    proxy_server = os.getenv("PROXY")
     slow_mo_env = int(os.getenv("SLOW_MO", "0"))
-    storage_state_path = os.getenv("STORAGE_STATE", "")  # path to storage_state file to reuse cookies
+    storage_state_path = os.getenv("STORAGE_STATE", "")
     headless_env = os.getenv("HEADLESS", "true").lower() not in ("0", "false", "no")
 
-    # Force headless in CI or if no DISPLAY available (prevents the X server error)
     if os.getenv("CI") or os.getenv("GITHUB_ACTIONS") or ("DISPLAY" not in os.environ and not headless_env):
-        if not headless_env:
-            # user asked for headed but an X server is not available (CI). We'll override.
-            if debug:
-                print("[debug] No DISPLAY or running in CI; forcing headless=True to avoid X server errors.")
+        if debug and not headless_env:
+            print("[debug] No DISPLAY or running in CI; forcing headless=True to avoid X server errors.")
         headless_env = True
 
     leads: List[Dict] = []
     async with async_playwright() as p:
-        # construct launch args
         launch_args = [
             "--no-sandbox",
             "--disable-blink-features=AutomationControlled",
@@ -527,7 +498,6 @@ async def run_scrape(
             "--mute-audio",
         ]
         if proxy_server:
-            # Playwright accepts proxy via launch args for Chromium: --proxy-server
             launch_args.append(f"--proxy-server={proxy_server}")
 
         try:
@@ -537,11 +507,9 @@ async def run_scrape(
                 args=launch_args,
             )
         except Exception as e:
-            # if launch still fails, surface a helpful message
             print("[error] Browser launch failed:", e)
             raise
 
-        # context kwargs; include storage_state if provided
         context_kwargs = dict(
             user_agent=get_random_user_agent(),
             viewport={"width": 1366, "height": 768},
@@ -549,13 +517,10 @@ async def run_scrape(
             timezone_id="America/Los_Angeles",
             bypass_csp=True,
         )
-        if storage_state_path:
-            # only attach if file exists
-            if os.path.exists(storage_state_path):
-                context_kwargs["storage_state"] = storage_state_path
-            else:
-                if debug:
-                    print(f"[debug] STORAGE_STATE path provided but file not found: {storage_state_path}")
+        if storage_state_path and os.path.exists(storage_state_path):
+            context_kwargs["storage_state"] = storage_state_path
+        elif storage_state_path and debug:
+            print(f"[debug] STORAGE_STATE path provided but file not found: {storage_state_path}")
 
         context = await browser.new_context(**context_kwargs)
 
@@ -579,7 +544,6 @@ async def run_scrape(
             if debug:
                 print(f"[debug] will scrape {len(collected_urls)} listings: {collected_urls}")
 
-            # scrape each listing
             for url in collected_urls:
                 if len(leads) >= max_total:
                     break
