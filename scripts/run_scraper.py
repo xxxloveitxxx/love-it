@@ -1,30 +1,60 @@
 # scripts/run_scraper.py
-
 import os
+import sys
 import asyncio
-from pprint import pprint
+import json
 
-# make sure our repo root is importable when run by GH Actions; your CI already does PYTHONPATH=.
-# from models import save_leads   <- import inside main so errors surface after scrape
+# ensure repo root is importable
+repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
+
+from scraper.zillow_scraper import run_scrape
+try:
+    import models
+except Exception:
+    models = None
 
 async def main():
-    from scraper.zillow_scraper import run_scrape
-    from models import save_leads
-
-    seeds_env = os.environ.get("SCRAPE_SEEDS")
+    # read seeds from env; if absent run defaults inside run_scrape
+    seeds_env = os.getenv("ZILLOW_SEED_URLS", "")
     if seeds_env:
         seeds = [s.strip() for s in seeds_env.split(",") if s.strip()]
     else:
-        seeds = None  # let run_scrape use defaults
+        seeds = None  # allow scraper to use its built-in defaults
 
-    print("Starting Zillow scrape; seeds:", "custom" if seeds else "default")
-    leads = await run_scrape(search_urls=seeds, max_per_seed=6, max_listings=12, debug=True)
-    print("Scraped", len(leads), "leads")
-    pprint(leads[:3])
-    print("Saving leads via models.save_leads...")
-    # save_leads should accept List[dict] and return supabase response
-    res = save_leads(leads)
-    print("Save result:", res)
+    # read various names that might be present in CI
+    max_per_seed = os.getenv("MAX_LISTINGS_PER_SEARCH")
+    max_listings = os.getenv("MAX_LISTINGS_TOTAL") or os.getenv("MAX_LISTINGS") or os.getenv("MAX_LISTINGS_TOTAL")
+    debug = os.getenv("DEBUG", "false").lower() in ("1", "true", "yes")
+
+    # build kwargs - pass both canonical and possible aliases
+    kwargs = {}
+    if seeds is not None:
+        kwargs["search_urls"] = seeds
+    if max_per_seed:
+        kwargs["max_per_seed"] = int(max_per_seed)
+    if max_listings:
+        kwargs["max_listings"] = int(max_listings)
+
+    # call scraper (it accepts aliases)
+    print("Starting Zillow scrape; seeds:", ("default" if seeds is None else seeds))
+    leads = await run_scrape(debug=debug, **kwargs)
+
+    print(f"Scraped {len(leads)} leads")
+    if len(leads) > 0:
+        print(json.dumps(leads, indent=2)[:2000])  # truncated output preview
+
+    # try to save via models if available
+    if models is not None:
+        try:
+            print("Saving leads via models.save_leads...")
+            res = models.save_leads(leads)
+            print("Save result:", res)
+        except Exception as e:
+            print("models.save_leads error:", e)
+    else:
+        print("models module not available — skipping save.")
 
 if __name__ == "__main__":
     asyncio.run(main())
